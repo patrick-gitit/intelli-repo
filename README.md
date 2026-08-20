@@ -1,6 +1,6 @@
 # Intelli-Repo
 
-Intelli-Repo adds an exact-pinned agent substrate, governed knowledge workflow, and inspectable lifecycle commands to an ordinary Git repository.
+Intelli-Repo turns an ordinary Git repository into a structured, inspectable environment for doing valuable work—and improving how that work gets done. Knowledge stays close to the work it informs. Decisions and policies make direction explicit, while tasks turn intent into action. Evidence preserves what happened and why. Humans and agents collaborate in the same version-controlled space, keeping the journey from idea to outcome understandable, reusable, and continuously improvable.
 
 > **Beta status:** `v0.1.0-beta.1` is the current public beta. Its pre-1.0 compatibility contract may change in later releases.
 
