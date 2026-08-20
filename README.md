@@ -8,51 +8,64 @@ Intelli-Repo turns an ordinary Git repository into a structured, inspectable env
 
 ## Install
 
-Stable convenience entrypoint:
+For a normal installation, use the stable entrypoint:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/patrick-gitit/intelli-repo/main/install.sh | sh
 ```
 
-Explicit immutable beta:
+The script on `main` points to one approved, immutable release. It does not search for the latest tag at runtime. It does not follow a component branch or query a hosting provider API. The mapping changes only when a new release is approved and published.
+
+To install the current beta from its immutable tag, use:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/patrick-gitit/intelli-repo/v0.1.0-beta.1/install.sh | sh
 ```
 
-The moving `main` script selects an immutable version before installing versioned content. Git commits, exact submodule gitlinks, and immutable annotated tags are version authority.
+You can also use `--version VERSION` when you need an explicit immutable version. Before running versioned content, the bootstrap verifies the selected tag's provenance and checksums.
 
-A plain bootstrap invocation is the default latest request: no version number is required. The `main/install.sh` facade contains one literal mapping to the current approved release and downloads executable content only from that immutable tag. It never discovers “latest” at runtime, follows a component branch, or queries a hosting-provider API. The mapping advances only through an approved release publication. Use `--version VERSION` only when an explicit immutable override is required; the selected tag's provenance and checksums are verified before execution.
+Git commits identify the exact content. Submodule gitlinks identify the exact agent revisions. Immutable annotated tags identify public releases. Together, these records provide the version authority for Intelli-Repo.
 
-## Runtime contract
+## Runtime requirements
 
-Intelli-Repo defines compatibility through a POSIX shell-and-capability contract, not through certification of operating systems, Linux distributions, WSL versions, architectures, containers, or other host permutations. The repository owner is responsible for establishing that a chosen environment satisfies this contract.
+Intelli-Repo checks what an environment can do instead of relying on its operating system label. It does not certify individual Linux distributions, WSL versions, processor architectures, containers, CI runners, or other host combinations. You are responsible for confirming that your environment meets the requirements below.
 
-Required capabilities are:
+The required capabilities are:
 
-- POSIX `sh`;
-- Git 2.34 or newer;
-- curl 7.81 or newer;
-- `sha256sum` or `shasum -a 256`;
-- the POSIX utilities exercised by the lifecycle scripts;
-- a functioning CA trust store and HTTPS access to GitHub-hosted public artifacts and repositories;
-- filesystem behavior sufficient for canonical paths, symlinks, permissions, executable modes, temporary directories, Git worktrees, and submodules.
+- A POSIX-compatible `sh` for running the scripts
+- Git 2.34 or newer for repository and submodule operations
+- curl 7.81 or newer for downloading public release artifacts
+- Either `sha256sum` or `shasum -a 256` for integrity checks
+- The POSIX utilities used by the lifecycle scripts
+- A working CA trust store for validating HTTPS connections
+- HTTPS access to the public artifacts and repositories hosted on GitHub
+- Filesystem support for canonical paths and symbolic links
+- Filesystem support for permissions and executable modes
+- Filesystem support for temporary directories, Git worktrees, and submodules
 
-GNU Make is optional. Managed Make targets are provided as a convenience when compatible Make is available; installation and direct `.intelli-repo/bin/intelli-repo` invocation do not require it. Preflight checks detectable required capabilities and fails before mutation when they are absent or incompatible. Passing preflight is not certification or a warranty for the user's host environment.
+GNU Make is optional. If a compatible version is available, Intelli-Repo adds convenient managed Make targets. Installation does not require Make, and you can always run `.intelli-repo/bin/intelli-repo` directly.
 
-## Command placement
+Preflight checks look for requirements that can be detected before a change begins. If a required capability is missing or incompatible, the operation stops before making changes. Passing preflight confirms the declared requirements only. It is not a certification or warranty for the host environment.
 
-Intelli-Repo keeps all distribution-owned command and orchestration code, executable and non-executable, under `.intelli-repo/bin/`. The canonical command is `.intelli-repo/bin/intelli-repo`; no separate utility `lib`, `libexec`, global executable directory, or global symlink is part of the installation. Exact-pinned agent repositories remain separate substrate components under their declared `.intelli-repo/*-agent/` paths.
+## Where the command lives
 
-Managed `intelli-repo-*` Make targets invoke the repository-local command directly. From the repository root, direct invocation is also available:
+Intelli-Repo keeps its command and orchestration code under `.intelli-repo/bin/`. The canonical command is:
+
+```text
+.intelli-repo/bin/intelli-repo
+```
+
+The installation does not create separate `lib` or `libexec` directories. It does not install a global executable or create a global symbolic link. Each exact-pinned agent remains a separate component under its declared `.intelli-repo/*-agent/` path.
+
+Managed `intelli-repo-*` Make targets call the repository-local command. You can also invoke it directly from the repository root:
 
 ```sh
 ./.intelli-repo/bin/intelli-repo doctor
 ```
 
-Installation never modifies `PATH` or shell startup files. A user may optionally prepend the canonical absolute repository-local `bin` path for the current shell session; Intelli-Repo does not execute or persist that change.
+Installation never changes `PATH` or your shell startup files. You may add the repository's absolute `.intelli-repo/bin/` path to `PATH` for the current shell session. Intelli-Repo will not make that choice or persist it for you.
 
-## Commands
+## Command reference
 
 ```text
 intelli-repo install [--repo PATH] [--version VERSION] [--dry-run] [--yes]
@@ -65,25 +78,125 @@ intelli-repo uninstall [--repo PATH] --purge-user-data --confirm-purge DELETE-US
 intelli-repo lint|audit|ingest|task|release
 ```
 
-Install and update operate on explicit compatible commits, display the complete proposed change, preserve unrelated work, validate before finalizing, and leave collision-free operation receipts. Updates acquire only the explicitly requested immutable tag, require the same lifecycle protocol, and retain their exact previous owned state in a named rollback payload. `update --rollback OPERATION_ID` refuses missing, consumed, ambiguous, or stale evidence and any intervening owned-state change. Failed mutations restore captured pre-state and record the outcome. Lifecycle operations never stage unrelated paths, commit, push, publish, follow a moving component branch, or change PATH.
+## How lifecycle operations behave
 
-Configuration is optional. With no mutation options, `configure` explains the convention defaults and reports current overrides. `--set-agent NAME=enabled|disabled` writes the strict schema-version-1 control plane only after displaying the proposal and receiving approval; recoverable pre-state is retained with the operation receipt. `doctor` is read-only and reports pass, fail, warning, not-applicable, and skipped checks for runtime, command, pins, submodule integrity, managed integration, configuration, operation state, optional Make, and rollback evidence.
+### Install and update
 
-Ordinary uninstall removes only exact, verified Intelli-Repo-owned integration and preserves `repo-agent-config.yaml`, user knowledge, workspace content, repository history, unrelated staging, unrelated files, and unrelated submodules. Altered or ambiguous owned integration fails before mutation. A recovery bundle restores captured state if mutation fails; after successful removal, reinstall works through the same immutable bootstrap.
+Install and update work with explicit, compatible commits. Before changing anything, the command shows the complete proposal. It preserves unrelated work and validates the result before finalizing the operation. Each completed operation leaves a uniquely named receipt.
 
-`--purge-user-data` separately enumerates and removes `repo-agent-config.yaml`, `wiki/`, and `workspace/` where present. It requires the literal `--confirm-purge DELETE-USER-DATA`; `--yes` alone cannot authorize it. Purged data is recoverable during a failed transaction but not from Intelli-Repo after successful completion.
+An update downloads only the immutable tag you request. The requested release must use the same lifecycle protocol as the installed version. Before applying the update, Intelli-Repo captures the exact owned state needed for rollback.
 
-The exact-pin install, configure, update, doctor, named rollback, conservative uninstall, purge, and reinstall transactions are implemented. Agent-provided capability commands continue to fail closed until their respective implementations are present. A release tag is not ready until the complete lifecycle and rollback gates pass.
+Use the operation ID from a successful update receipt to roll back:
 
-Release candidates are evaluated against executable public-tree, reproducibility, bootstrap, lifecycle, adversarial-input, redaction, and publication-refusal gates. The private evidence identifies the exact source, tooling, agent, and public-distribution revisions and fails closed for missing or required skipped gates. This evidence establishes conformance to the declared script contract, not certification of a user's host permutation, and never grants publication authority.
+```sh
+intelli-repo update --rollback OPERATION_ID
+```
+
+Rollback fails safely when the receipt is missing, ambiguous, stale, or already consumed. It also refuses to continue if Intelli-Repo-owned state has changed since the update.
+
+If an install, update, or rollback fails after mutation begins, Intelli-Repo attempts to restore the captured state. It records whether recovery succeeded and never reports success when restoration fails.
+
+Lifecycle operations stay within their declared scope. They do not stage unrelated paths. They do not create commits, push changes, publish releases, follow moving component branches, or alter `PATH`.
+
+### Configuration
+
+Configuration is optional. Run `configure` without change options to see the convention-based defaults and any current overrides.
+
+To enable or disable an agent, use:
+
+```sh
+intelli-repo configure --set-agent NAME=enabled|disabled
+```
+
+Intelli-Repo displays the proposed configuration before writing it and requires approval. The resulting `repo-agent-config.yaml` follows the strict version 1 schema. The operation receipt retains enough prior state to recover from a failed change.
+
+### Doctor
+
+`doctor` is read-only. It checks the installed runtime, command, agent pins, submodule integrity, managed integration, configuration, operation state, optional Make support, and available rollback evidence.
+
+Each applicable check has one of these results:
+
+- `pass` means the check succeeded
+- `fail` means the installation does not meet the requirement
+- `warning` identifies a concern that does not make the installation invalid
+- `not-applicable` means the check does not apply to the current state
+- `skipped` means the check could not or did not need to run
+
+### Uninstall
+
+An ordinary uninstall removes only verified Intelli-Repo-owned integration. It preserves the following user and repository state:
+
+- `repo-agent-config.yaml`
+- Knowledge stored under `wiki/`
+- Content stored under `workspace/`
+- Repository history
+- Unrelated staged changes
+- Unrelated files
+- Unrelated submodules
+
+If owned integration has been changed or cannot be identified safely, uninstall stops before mutation. If removal fails after mutation begins, a recovery bundle is used to restore the captured state. After a successful uninstall, you can reinstall through the same immutable bootstrap.
+
+### Purge user data
+
+Purge is a separate destructive operation. It removes these paths when they exist:
+
+- `repo-agent-config.yaml`
+- `wiki/`
+- `workspace/`
+
+Purge requires the literal confirmation below:
+
+```text
+--confirm-purge DELETE-USER-DATA
+```
+
+The `--yes` option is not enough to authorize a purge. During a failed transaction, Intelli-Repo attempts to recover purged data from its temporary recovery state. After a successful purge, Intelli-Repo makes no recovery promise.
+
+## Current capability status
+
+The following lifecycle operations are implemented:
+
+- Exact-pin install
+- Optional configuration
+- Exact-version update
+- Read-only doctor
+- Named rollback
+- Conservative uninstall
+- Explicit purge
+- Clean reinstall
+
+Agent-provided `lint`, `audit`, `ingest`, `task`, and `release` commands remain unavailable until their respective agents implement them. These commands fail closed instead of pretending to complete work.
+
+A release is not ready until its lifecycle and rollback gates pass. Release candidates are checked for public-tree integrity and reproducibility. They are also tested for bootstrap behavior, lifecycle behavior, adversarial input handling, secret redaction, and refusal to publish without approval.
+
+Private release evidence records the exact source revision. It also records the tooling revision, agent revisions, public distribution revision, and gate results. A missing required gate or a required skipped gate makes the evaluation fail.
+
+This evidence shows conformance to the declared script contract. It does not certify every possible host environment, and it never grants permission to publish a release.
 
 ## Troubleshooting
 
-Run `intelli-repo doctor --repo PATH` and retain the redacted operation identifier. Check that the target is a bounded Git worktree, the supported tools are available, network certificate validation succeeds, and installed submodule pins match the selected distribution version. Do not publish logs containing credentials, repository-private paths, or vulnerability details.
+Start with:
+
+```sh
+intelli-repo doctor --repo PATH
+```
+
+Keep the redacted operation identifier from the output. It can help connect a problem to the relevant local evidence.
+
+If an operation fails, check each of these conditions:
+
+- The target is a bounded Git worktree
+- The required tools are installed at supported versions
+- Network certificate validation succeeds
+- The installed submodule pins match the selected distribution version
+
+Review logs before sharing them. Do not publish credentials. Remove private repository paths and other private content. Do not place sensitive vulnerability details in a public issue.
 
 ## Security
 
-See [SECURITY.md](SECURITY.md) for the no-warranty, no-guaranteed-security-support posture and reporting limitations. Public issues may be used for non-sensitive defects; do not publish credentials, private content, personal data, or sensitive exploit details.
+Read [SECURITY.md](SECURITY.md) for the project's support and reporting posture. Intelli-Repo is provided without guaranteed security support or maintenance.
+
+Public issues may be used for non-sensitive defects. Do not publish credentials, private content, personal data, or sensitive exploit details.
 
 ## License
 
