@@ -1,0 +1,1548 @@
+#!/bin/sh
+set -eu
+
+readonly_distribution_version='v0.1.0-beta.1'
+readonly_base_agent_commit='9b3eec9f0566da3ace5ab0cb47d4c5a2dc1d9b0a'
+readonly_operator_agent_commit='e8aec0e5f88af5624aa12f37656c9ef7243f70ca'
+readonly_wiki_agent_commit='3543fdb11791fd2298c62bb41301bec628768501'
+readonly_base_agent_url='https://github.com/patrick-gitit/irp_base-agent.git'
+readonly_operator_agent_url='https://github.com/patrick-gitit/irp_operator-agent.git'
+readonly_wiki_agent_url='https://github.com/patrick-gitit/irp_wiki-agent.git'
+readonly_public_base='https://raw.githubusercontent.com/patrick-gitit/intelli-repo'
+base_agent_url=$readonly_base_agent_url
+operator_agent_url=$readonly_operator_agent_url
+wiki_agent_url=$readonly_wiki_agent_url
+readonly_exit_usage=64
+readonly_exit_preflight=65
+readonly_exit_approval=66
+readonly_exit_compatibility=67
+readonly_exit_mutation=68
+readonly_exit_validation=69
+readonly_exit_rollback=70
+readonly_lifecycle_protocol=1
+
+usage() {
+    cat <<'USAGE'
+Usage: intelli-repo COMMAND [OPTIONS]
+
+Lifecycle commands:
+  install      Install exact-pinned Intelli-Repo components
+  configure    Explain defaults or update optional configuration
+  update       Update to an exact version or roll back a named update
+  doctor       Inspect repository and installation health
+  uninstall    Remove owned integration; preserve user data by default
+
+Capability commands:
+  lint         Run the exact-pinned lint capability
+  audit        Run the exact-pinned audit capability
+  ingest       Run the exact-pinned inbox capability
+  task         Run the exact-pinned task capability
+  release      Evaluate release readiness without implying publication
+
+Global commands:
+  version      Print the exact command version
+  help         Show this help
+
+Common options are --repo PATH, --dry-run, and --yes. Install accepts --version
+VERSION. Update requires either --version VERSION or --rollback OPERATION_ID.
+Configure accepts repeatable --set-agent NAME=enabled|disabled. Uninstall
+accepts --purge-user-data only through its separate confirmation contract.
+USAGE
+}
+
+fail() {
+    printf 'intelli-repo: %s\n' "$1" >&2
+    exit "${2:-$readonly_exit_usage}"
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1" "$readonly_exit_preflight"
+}
+
+digest_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{ print $1 }'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{ print $1 }'
+    else
+        fail 'sha256sum or shasum is required' "$readonly_exit_preflight"
+    fi
+}
+
+semver_valid() {
+    printf '%s\n' "$1" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z][0-9A-Za-z.-]*)?$'
+}
+
+commit_valid() {
+    printf '%s\n' "$1" | grep -Eq '^[0-9a-f]{40}$'
+}
+
+digest_valid() {
+    printf '%s\n' "$1" | grep -Eq '^[0-9a-f]{64}$'
+}
+
+version_at_least() {
+    actual=$1
+    required=$2
+    awk -v actual="$actual" -v required="$required" 'BEGIN {
+        split(actual, a, "."); split(required, r, ".");
+        for (i = 1; i <= 3; i++) {
+            a[i] += 0; r[i] += 0
+            if (a[i] > r[i]) exit 0
+            if (a[i] < r[i]) exit 1
+        }
+        exit 0
+    }'
+}
+
+yaml_scalar() {
+    yaml_key=$1
+    yaml_file=$2
+    yaml_lines=$(grep -Ec "^$yaml_key: \"[^\"]*\"$" "$yaml_file" || true)
+    [ "$yaml_lines" -eq 1 ] || return 1
+    sed -n "s/^$yaml_key: \"\([^\"]*\)\"$/\1/p" "$yaml_file"
+}
+
+yaml_component() {
+    yaml_key=$1
+    yaml_file=$2
+    yaml_lines=$(grep -Ec "^  $yaml_key: \"[0-9a-f]{40}\"$" "$yaml_file" || true)
+    [ "$yaml_lines" -eq 1 ] || return 1
+    sed -n "s/^  $yaml_key: \"\([0-9a-f]\{40\}\)\"$/\1/p" "$yaml_file"
+}
+
+configuration_value() {
+    configuration_file=$1
+    configuration_key=$2
+    configuration_default=$3
+    if [ ! -f "$configuration_file" ]; then
+        printf '%s\n' "$configuration_default"
+        return
+    fi
+    yaml_scalar "$configuration_key" "$configuration_file"
+}
+
+validate_configuration() {
+    configuration_file=$1
+    [ -e "$configuration_file" ] || return 0
+    [ -f "$configuration_file" ] && [ ! -L "$configuration_file" ] || return 1
+    meaningful_lines=$(grep -Evc '^[[:space:]]*(#.*)?$' "$configuration_file" || true)
+    [ "$meaningful_lines" -eq 4 ] || return 1
+    [ "$(yaml_scalar schema_version "$configuration_file" 2>/dev/null || true)" = 1 ] || return 1
+    for configuration_key in base_agent operator_agent wiki_agent; do
+        configuration_setting=$(yaml_scalar "$configuration_key" "$configuration_file" 2>/dev/null || true)
+        case "$configuration_setting" in enabled|disabled) ;; *) return 1 ;; esac
+    done
+}
+
+render_configuration() {
+    output_file=$1
+    base_setting=$2
+    operator_setting=$3
+    wiki_setting=$4
+    cat >"$output_file" <<EOF
+schema_version: "1"
+base_agent: "$base_setting"
+operator_agent: "$operator_setting"
+wiki_agent: "$wiki_setting"
+EOF
+}
+
+resolve_installed_repository() {
+    requested_repository=$1
+    canonical_request=$(canonical_requested_path "$requested_repository") || fail 'target path cannot be resolved' "$readonly_exit_preflight"
+    case "$canonical_request" in /) fail 'filesystem root cannot be a lifecycle target' "$readonly_exit_preflight" ;; esac
+    repository_root=$(find_repository_root "$canonical_request") || fail 'target is not a Git worktree' "$readonly_exit_preflight"
+    repository_root=$(CDPATH= cd -- "$repository_root" && pwd -P)
+    for boundary_path in .intelli-repo .intelli-repo/bin .intelli-repo/operations .intelli-repo/base-agent .intelli-repo/operator-agent .intelli-repo/wiki-agent .gitmodules Makefile repo-agent-config.yaml; do
+        [ ! -L "$repository_root/$boundary_path" ] || fail "symlinked managed boundary is prohibited: $boundary_path" "$readonly_exit_preflight"
+    done
+    [ -x "$repository_root/.intelli-repo/bin/intelli-repo" ] || fail 'Intelli-Repo is not installed in the target worktree' "$readonly_exit_compatibility"
+}
+
+approve_proposal() {
+    approval_granted=$1
+    approval_prompt=$2
+    if [ "$approval_granted" -eq 1 ]; then
+        return
+    fi
+    [ -r /dev/tty ] && [ -w /dev/tty ] || fail 'approval requires /dev/tty or explicit --yes' "$readonly_exit_approval"
+    if ! ( : </dev/tty >/dev/tty ) 2>/dev/null; then
+        fail 'approval requires a controlling terminal or explicit --yes' "$readonly_exit_approval"
+    fi
+    printf '%s' "$approval_prompt" >/dev/tty
+    IFS= read -r approval_response </dev/tty || fail 'approval could not be read' "$readonly_exit_approval"
+    [ "$approval_response" = yes ] || fail 'operation was not approved' "$readonly_exit_approval"
+}
+
+approve_destructive_purge() {
+    destructive_confirmation=$1
+    if [ "$destructive_confirmation" = DELETE-USER-DATA ]; then
+        return
+    fi
+    [ -r /dev/tty ] && [ -w /dev/tty ] || fail 'purge requires --confirm-purge DELETE-USER-DATA or a controlling terminal' "$readonly_exit_approval"
+    if ! ( : </dev/tty >/dev/tty ) 2>/dev/null; then
+        fail 'purge requires --confirm-purge DELETE-USER-DATA or a controlling terminal' "$readonly_exit_approval"
+    fi
+    printf '%s' 'Permanently delete the listed user data? Type DELETE-USER-DATA: ' >/dev/tty
+    IFS= read -r destructive_response </dev/tty || fail 'destructive approval could not be read' "$readonly_exit_approval"
+    [ "$destructive_response" = DELETE-USER-DATA ] || fail 'purge was not explicitly confirmed' "$readonly_exit_approval"
+}
+
+find_repository_root() {
+    git -C "$1" rev-parse --show-toplevel 2>/dev/null || return 1
+}
+
+canonical_requested_path() {
+    requested_path=$1
+    if [ -d "$requested_path" ]; then
+        (CDPATH= cd -- "$requested_path" && pwd -P)
+        return
+    fi
+    requested_parent=${requested_path%/*}
+    [ "$requested_parent" = "$requested_path" ] && requested_parent=.
+    requested_name=${requested_path##*/}
+    [ -n "$requested_name" ] || return 1
+    canonical_parent=$(CDPATH= cd -- "$requested_parent" 2>/dev/null && pwd -P) || return 1
+    printf '%s/%s\n' "$canonical_parent" "$requested_name"
+}
+
+preflight_runtime() {
+    require_command git
+    require_command curl
+    require_command awk
+    require_command cat
+    require_command chmod
+    require_command cmp
+    require_command cp
+    require_command date
+    require_command find
+    require_command grep
+    require_command head
+    require_command mkdir
+    require_command sed
+    require_command mktemp
+    require_command mv
+    require_command rm
+    require_command rmdir
+    require_command tr
+    require_command wc
+    git_version=$(git --version | awk '{ print $3 }')
+    curl_version=$(curl --version | awk 'NR == 1 { print $2 }')
+    version_at_least "$git_version" 2.34.0 || fail "Git 2.34 or newer is required; found $git_version" "$readonly_exit_compatibility"
+    version_at_least "$curl_version" 7.81.0 || fail "curl 7.81 or newer is required; found $curl_version" "$readonly_exit_compatibility"
+    if command -v make >/dev/null 2>&1; then
+        make_description=$(make --version 2>/dev/null | awk 'NR == 1 { print; exit }' || true)
+        case "$make_description" in
+            'GNU Make '*) make_status=$make_description ;;
+            *) make_status='present but not GNU Make; convenience targets are not certified' ;;
+        esac
+    else
+        make_status='absent; use the repository-local command directly'
+    fi
+}
+
+validate_bootstrap_evidence() {
+    selected_version=$1
+    provenance_file=${INTELLI_REPO_BOOTSTRAP_PROVENANCE:-}
+    checksum_file=${INTELLI_REPO_BOOTSTRAP_CHECKSUMS:-}
+    bootstrap_version=${INTELLI_REPO_BOOTSTRAP_VERSION:-}
+    if [ -n "$provenance_file$checksum_file$bootstrap_version" ]; then
+        [ -r "$provenance_file" ] && [ -r "$checksum_file" ] || fail 'bootstrap evidence is incomplete' "$readonly_exit_preflight"
+        [ "$bootstrap_version" = "$selected_version" ] || fail 'bootstrap version mismatch' "$readonly_exit_preflight"
+        provenance_version=$(yaml_scalar distribution_version "$provenance_file") || fail 'invalid distribution provenance' "$readonly_exit_preflight"
+        provenance_base=$(yaml_component base_agent "$provenance_file") || fail 'invalid base-agent provenance' "$readonly_exit_preflight"
+        provenance_operator=$(yaml_component operator_agent "$provenance_file") || fail 'invalid operator-agent provenance' "$readonly_exit_preflight"
+        provenance_wiki=$(yaml_component wiki_agent "$provenance_file") || fail 'invalid wiki-agent provenance' "$readonly_exit_preflight"
+        [ "$provenance_version" = "$readonly_distribution_version" ] || fail 'command and provenance versions differ' "$readonly_exit_preflight"
+        [ "$provenance_base" = "$readonly_base_agent_commit" ] || fail 'base-agent pin differs from provenance' "$readonly_exit_preflight"
+        [ "$provenance_operator" = "$readonly_operator_agent_commit" ] || fail 'operator-agent pin differs from provenance' "$readonly_exit_preflight"
+        [ "$provenance_wiki" = "$readonly_wiki_agent_commit" ] || fail 'wiki-agent pin differs from provenance' "$readonly_exit_preflight"
+    fi
+}
+
+managed_make_region() {
+    cat <<'REGION'
+# BEGIN INTELLI-REPO MANAGED v1
+.PHONY: intelli-repo-configure intelli-repo-update intelli-repo-doctor intelli-repo-lint intelli-repo-audit intelli-repo-ingest intelli-repo-task intelli-repo-release intelli-repo-uninstall
+intelli-repo-configure intelli-repo-update intelli-repo-doctor intelli-repo-lint intelli-repo-audit intelli-repo-ingest intelli-repo-task intelli-repo-release intelli-repo-uninstall:
+	$(CURDIR)/.intelli-repo/bin/intelli-repo $(@:intelli-repo-%=%) --repo $(CURDIR)
+# END INTELLI-REPO MANAGED v1
+REGION
+}
+
+render_makefile() {
+    source_file=$1
+    output_file=$2
+    region_file=$3
+    begin_count=0
+    end_count=0
+    if [ -f "$source_file" ]; then
+        begin_count=$(grep -Fc '# BEGIN INTELLI-REPO MANAGED v1' "$source_file" || true)
+        end_count=$(grep -Fc '# END INTELLI-REPO MANAGED v1' "$source_file" || true)
+    fi
+    if [ "$begin_count" -eq 0 ] && [ "$end_count" -eq 0 ]; then
+        if [ -f "$source_file" ]; then
+            cat "$source_file" >"$output_file"
+            [ ! -s "$source_file" ] || printf '\n' >>"$output_file"
+        else
+            : >"$output_file"
+        fi
+        cat "$region_file" >>"$output_file"
+    elif [ "$begin_count" -eq 1 ] && [ "$end_count" -eq 1 ]; then
+        awk -v region="$region_file" '
+            $0 == "# BEGIN INTELLI-REPO MANAGED v1" {
+                while ((getline line < region) > 0) print line
+                close(region); inside = 1; next
+            }
+            $0 == "# END INTELLI-REPO MANAGED v1" { if (!inside) exit 2; inside = 0; next }
+            !inside { print }
+            END { if (inside) exit 2 }
+        ' "$source_file" >"$output_file" || fail 'malformed managed Makefile region' "$readonly_exit_preflight"
+    else
+        fail 'ambiguous managed Makefile markers' "$readonly_exit_preflight"
+    fi
+}
+
+render_makefile_without_region() {
+    source_file=$1
+    output_file=$2
+    begin_count=$(grep -Fc '# BEGIN INTELLI-REPO MANAGED v1' "$source_file" 2>/dev/null || true)
+    end_count=$(grep -Fc '# END INTELLI-REPO MANAGED v1' "$source_file" 2>/dev/null || true)
+    [ "$begin_count" -eq 1 ] && [ "$end_count" -eq 1 ] || fail 'managed Makefile region is missing or ambiguous' "$readonly_exit_preflight"
+    awk '
+        $0 == "# BEGIN INTELLI-REPO MANAGED v1" { if (inside) exit 2; inside = 1; next }
+        $0 == "# END INTELLI-REPO MANAGED v1" { if (!inside) exit 2; inside = 0; next }
+        !inside { print }
+        END { if (inside) exit 2 }
+    ' "$source_file" >"$output_file" || fail 'could not remove the exact managed Makefile region' "$readonly_exit_preflight"
+}
+
+validate_owned_module_section() {
+    modules_file=$1
+    component=$2
+    expected_url=$3
+    module_name=intelli-repo-$component
+    component_path=.intelli-repo/$component
+    section_lines=$(git config -f "$modules_file" --get-regexp "^submodule\\.$module_name\\." 2>/dev/null || true)
+    [ "$(printf '%s\n' "$section_lines" | grep -Ec '^submodule\.[^.]+\.(path|url) ' || true)" -eq 2 ] || return 1
+    [ "$(git config -f "$modules_file" --get-all "submodule.$module_name.path" 2>/dev/null | wc -l | tr -d ' ')" -eq 1 ] || return 1
+    [ "$(git config -f "$modules_file" --get "submodule.$module_name.path" 2>/dev/null || true)" = "$component_path" ] || return 1
+    [ "$(git config -f "$modules_file" --get-all "submodule.$module_name.url" 2>/dev/null | wc -l | tr -d ' ')" -eq 1 ] || return 1
+    [ "$(git config -f "$modules_file" --get "submodule.$module_name.url" 2>/dev/null || true)" = "$expected_url" ] || return 1
+}
+
+remove_owned_module_sections() {
+    source_file=$1
+    output_file=$2
+    cp -p "$source_file" "$output_file"
+    for component_record in \
+        "base-agent|$base_agent_url" \
+        "operator-agent|$operator_agent_url" \
+        "wiki-agent|$wiki_agent_url"
+    do
+        component=${component_record%%|*}
+        expected_url=${component_record#*|}
+        validate_owned_module_section "$source_file" "$component" "$expected_url" || fail "owned .gitmodules section is altered or ambiguous: $component" "$readonly_exit_compatibility"
+        git config -f "$output_file" --remove-section "submodule.intelli-repo-$component" || fail "could not prepare .gitmodules removal for $component" "$readonly_exit_mutation"
+    done
+}
+
+submodule_entry_for_path() {
+    modules_file=$1
+    target_path=$2
+    [ -f "$modules_file" ] || return 1
+    git config -f "$modules_file" --get-regexp '^submodule\..*\.path$' 2>/dev/null |
+        awk -v target="$target_path" '$2 == target { print $1; found = 1 } END { if (!found) exit 1 }' |
+        sed 's/\.path$//'
+}
+
+index_commit() {
+    repository_root=$1
+    target_path=$2
+    record=$(git -C "$repository_root" ls-files --stage -- "$target_path")
+    [ "$(printf '%s\n' "$record" | awk '{ print $1 }')" = 160000 ] || return 1
+    printf '%s\n' "$record" | awk '{ print $2 }'
+}
+
+validate_installation() {
+    repository_root=$1
+    modules_file=$repository_root/.gitmodules
+    [ -x "$repository_root/.intelli-repo/bin/intelli-repo" ] || return 1
+    [ "$("$repository_root/.intelli-repo/bin/intelli-repo" version)" = "$readonly_distribution_version" ] || return 1
+    cmp -s "$0" "$repository_root/.intelli-repo/bin/intelli-repo" || return 1
+    for component_record in \
+        "base-agent|$readonly_base_agent_commit|$base_agent_url" \
+        "operator-agent|$readonly_operator_agent_commit|$operator_agent_url" \
+        "wiki-agent|$readonly_wiki_agent_commit|$wiki_agent_url"
+    do
+        component=${component_record%%|*}
+        remainder=${component_record#*|}
+        expected_commit=${remainder%%|*}
+        expected_url=${remainder#*|}
+        component_path=.intelli-repo/$component
+        [ "$(index_commit "$repository_root" "$component_path")" = "$expected_commit" ] || return 1
+        [ "$(git -C "$repository_root/$component_path" rev-parse HEAD 2>/dev/null)" = "$expected_commit" ] || return 1
+        [ -z "$(git -C "$repository_root/$component_path" status --porcelain 2>/dev/null)" ] || return 1
+        module_key=$(submodule_entry_for_path "$modules_file" "$component_path") || return 1
+        [ "$(git config -f "$modules_file" --get "$module_key.url")" = "$expected_url" ] || return 1
+        [ -z "$(git config -f "$modules_file" --get "$module_key.branch" 2>/dev/null || true)" ] || return 1
+    done
+    [ "$(grep -Fc '# BEGIN INTELLI-REPO MANAGED v1' "$repository_root/Makefile" 2>/dev/null || true)" -eq 1 ] || return 1
+    [ "$(grep -Fc '# END INTELLI-REPO MANAGED v1' "$repository_root/Makefile" 2>/dev/null || true)" -eq 1 ] || return 1
+    [ "$(awk '/^# BEGIN INTELLI-REPO MANAGED v1$/ { inside = 1 } inside { count++ } /^# END INTELLI-REPO MANAGED v1$/ { print count; exit }' "$repository_root/Makefile")" -eq 5 ] || return 1
+    grep -Fqx '.PHONY: intelli-repo-configure intelli-repo-update intelli-repo-doctor intelli-repo-lint intelli-repo-audit intelli-repo-ingest intelli-repo-task intelli-repo-release intelli-repo-uninstall' "$repository_root/Makefile" || return 1
+    grep -Fqx '	$(CURDIR)/.intelli-repo/bin/intelli-repo $(@:intelli-repo-%=%) --repo $(CURDIR)' "$repository_root/Makefile" || return 1
+}
+
+write_receipt() {
+    receipt_file=$1
+    receipt_result=$2
+    receipt_approval=$3
+    receipt_selection=$4
+    receipt_new_repository=$5
+    mkdir -p "${receipt_file%/*}"
+    cat >"$receipt_file" <<EOF
+schema_version: 1
+operation: install
+operation_id: "${receipt_file##*/}"
+distribution_version: "$readonly_distribution_version"
+selection_context: "$receipt_selection"
+approval: "$receipt_approval"
+new_repository: "$receipt_new_repository"
+result: "$receipt_result"
+components:
+  base_agent: "$readonly_base_agent_commit"
+  operator_agent: "$readonly_operator_agent_commit"
+  wiki_agent: "$readonly_wiki_agent_commit"
+git_index_changes_disclosed: true
+publication_performed: false
+EOF
+}
+
+doctor_result() {
+    doctor_state=$1
+    doctor_name=$2
+    doctor_detail=$3
+    printf '%s %-34s %s\n' "$doctor_state" "$doctor_name" "$doctor_detail"
+    [ "$doctor_state" != fail ] || doctor_failures=$((doctor_failures + 1))
+}
+
+doctor_command() {
+    requested_repository=.
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --repo) [ "$#" -ge 2 ] || fail '--repo requires a value'; requested_repository=$2; shift 2 ;;
+            --help|-h) printf '%s\n' 'Usage: intelli-repo doctor [--repo PATH]'; return ;;
+            *) fail "unknown doctor argument: $1" ;;
+        esac
+    done
+    preflight_runtime
+    resolve_installed_repository "$requested_repository"
+    doctor_failures=0
+    printf 'Intelli-Repo doctor: %s\n' "$repository_root"
+    doctor_result pass repository.identity 'bounded Git worktree'
+
+    installed_command=$repository_root/.intelli-repo/bin/intelli-repo
+    installed_version=$("$installed_command" version 2>/dev/null || true)
+    if [ "$installed_version" = "$readonly_distribution_version" ] && cmp -s "$0" "$installed_command"; then
+        doctor_result pass installation.command "$installed_version exact command"
+    else
+        doctor_result fail installation.command "expected $readonly_distribution_version exact command; found ${installed_version:-unreadable}"
+    fi
+
+    for component_record in \
+        "base-agent|$readonly_base_agent_commit|$base_agent_url" \
+        "operator-agent|$readonly_operator_agent_commit|$operator_agent_url" \
+        "wiki-agent|$readonly_wiki_agent_commit|$wiki_agent_url"
+    do
+        component=${component_record%%|*}
+        remainder=${component_record#*|}
+        expected_commit=${remainder%%|*}
+        expected_url=${remainder#*|}
+        component_path=.intelli-repo/$component
+        actual_index=$(index_commit "$repository_root" "$component_path" 2>/dev/null || true)
+        actual_head=$(git -C "$repository_root/$component_path" rev-parse HEAD 2>/dev/null || true)
+        component_dirty=$(git -C "$repository_root/$component_path" status --porcelain 2>/dev/null || printf '%s' unreadable)
+        module_key=$(submodule_entry_for_path "$repository_root/.gitmodules" "$component_path" 2>/dev/null || true)
+        actual_url=''
+        [ -z "$module_key" ] || actual_url=$(git config -f "$repository_root/.gitmodules" --get "$module_key.url" 2>/dev/null || true)
+        if [ "$actual_index" = "$expected_commit" ] && [ "$actual_head" = "$expected_commit" ] && [ -z "$component_dirty" ] && [ "$actual_url" = "$expected_url" ]; then
+            doctor_result pass "component.$component" "$expected_commit"
+        else
+            doctor_result fail "component.$component" 'pin, checkout, cleanliness, or URL mismatch'
+        fi
+    done
+
+    expected_managed_region=$(managed_make_region)
+    actual_managed_region=$(awk '
+        $0 == "# BEGIN INTELLI-REPO MANAGED v1" { inside = 1 }
+        inside { print }
+        $0 == "# END INTELLI-REPO MANAGED v1" { inside = 0; exit }
+    ' "$repository_root/Makefile" 2>/dev/null || true)
+    if [ "$(grep -Fc '# BEGIN INTELLI-REPO MANAGED v1' "$repository_root/Makefile" 2>/dev/null || true)" -eq 1 ] &&
+       [ "$(grep -Fc '# END INTELLI-REPO MANAGED v1' "$repository_root/Makefile" 2>/dev/null || true)" -eq 1 ] &&
+       [ "$actual_managed_region" = "$expected_managed_region" ]; then
+        doctor_result pass integration.makefile 'managed region is exact'
+    else
+        doctor_result fail integration.makefile 'managed region missing or ambiguous'
+    fi
+
+    if [ ! -e "$repository_root/repo-agent-config.yaml" ]; then
+        doctor_result not-applicable configuration 'absent; convention defaults apply'
+    elif validate_configuration "$repository_root/repo-agent-config.yaml"; then
+        doctor_result pass configuration 'schema version 1 is valid'
+    else
+        doctor_result fail configuration 'invalid schema or unsupported value; run configure'
+    fi
+
+    stale_operation=$(find "$repository_root/.intelli-repo/operations" -maxdepth 1 -type f -name '*.pending' -print -quit 2>/dev/null || true)
+    if [ -z "$stale_operation" ]; then
+        doctor_result pass operation.state 'no stale pending operation'
+    else
+        doctor_result fail operation.state "stale operation ${stale_operation##*/}"
+    fi
+    rollback_payload=''
+    for update_receipt in "$repository_root"/.intelli-repo/operations/*-update-*.yaml; do
+        [ -f "$update_receipt" ] && [ ! -L "$update_receipt" ] || continue
+        [ "$(yaml_scalar operation "$update_receipt" 2>/dev/null || true)" = update ] || continue
+        [ "$(yaml_scalar result "$update_receipt" 2>/dev/null || true)" = success ] || continue
+        candidate_payload=$(yaml_scalar rollback_payload "$update_receipt" 2>/dev/null || true)
+        case "$candidate_payload" in ''|*[!A-Za-z0-9._-]*|*/*) continue ;; esac
+        [ -d "$repository_root/.intelli-repo/operations/$candidate_payload" ] || continue
+        [ ! -e "$repository_root/.intelli-repo/operations/$candidate_payload/consumed-by" ] || continue
+        rollback_payload=$candidate_payload
+        break
+    done
+    if [ -n "$rollback_payload" ]; then
+        doctor_result pass rollback.evidence 'named update rollback is available'
+    else
+        doctor_result not-applicable rollback.evidence 'no successful update receipt'
+    fi
+    case "$make_status" in
+        'GNU Make '*) doctor_result pass make.convenience "$make_status" ;;
+        *) doctor_result warning make.convenience "$make_status" ;;
+    esac
+    doctor_result skipped network.acquisition 'not required for read-only local diagnosis'
+
+    [ "$doctor_failures" -eq 0 ] || fail "$doctor_failures doctor check(s) failed" "$readonly_exit_validation"
+    printf '%s\n' 'Intelli-Repo doctor result: healthy'
+}
+
+configure_command() {
+    requested_repository=.
+    dry_run=0
+    approved=0
+    approval_kind=tty
+    set_specs=''
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --repo) [ "$#" -ge 2 ] || fail '--repo requires a value'; requested_repository=$2; shift 2 ;;
+            --set-agent) [ "$#" -ge 2 ] || fail '--set-agent requires NAME=STATE'; set_specs="$set_specs $2"; shift 2 ;;
+            --dry-run) dry_run=1; shift ;;
+            --yes) approved=1; approval_kind=explicit-yes; shift ;;
+            --help|-h) printf '%s\n' 'Usage: intelli-repo configure [--repo PATH] [--set-agent NAME=enabled|disabled]... [--dry-run] [--yes]'; return ;;
+            *) fail "unknown configure argument: $1" ;;
+        esac
+    done
+    preflight_runtime
+    resolve_installed_repository "$requested_repository"
+    target_configuration_file=$repository_root/repo-agent-config.yaml
+    validate_configuration "$target_configuration_file" || fail 'existing repo-agent-config.yaml is invalid; repair it before automated configuration' "$readonly_exit_validation"
+    base_setting=$(configuration_value "$target_configuration_file" base_agent enabled)
+    operator_setting=$(configuration_value "$target_configuration_file" operator_agent enabled)
+    wiki_setting=$(configuration_value "$target_configuration_file" wiki_agent enabled)
+
+    printf '%s\n' 'Intelli-Repo convention defaults'
+    printf '%s\n' '  configuration file: optional repo-agent-config.yaml'
+    printf '%s\n' '  default agents: base-agent=enabled operator-agent=enabled wiki-agent=enabled'
+    printf '%s\n' '  control-plane changes: always displayed and explicitly approved'
+    if [ -z "$set_specs" ]; then
+        if [ -e "$target_configuration_file" ]; then
+            printf '  current overrides: base-agent=%s operator-agent=%s wiki-agent=%s\n' "$base_setting" "$operator_setting" "$wiki_setting"
+        else
+            printf '%s\n' '  current overrides: absent; defaults apply'
+        fi
+        return
+    fi
+
+    for set_spec in $set_specs; do
+        agent_name=${set_spec%%=*}
+        agent_state=${set_spec#*=}
+        [ "$agent_name" != "$set_spec" ] || fail "invalid --set-agent value: $set_spec"
+        case "$agent_state" in enabled|disabled) ;; *) fail "invalid agent state: $agent_state" ;; esac
+        case "$agent_name" in
+            base-agent) base_setting=$agent_state ;;
+            operator-agent) operator_setting=$agent_state ;;
+            wiki-agent) wiki_setting=$agent_state ;;
+            *) fail "unknown agent: $agent_name" ;;
+        esac
+    done
+
+    operation_id=$(date -u '+%Y%m%dT%H%M%SZ')-configure-$$
+    operations_root=$repository_root/.intelli-repo/operations
+    transaction_root=$(mktemp -d "${TMPDIR:-/tmp}/intelli-repo-configure.XXXXXX") || fail 'could not create configuration transaction' "$readonly_exit_preflight"
+    cleanup_configure() {
+        case ${transaction_root##*/} in intelli-repo-configure.??????) rm -rf -- "$transaction_root" ;; esac
+    }
+    trap cleanup_configure EXIT HUP INT TERM
+    render_configuration "$transaction_root/config.after" "$base_setting" "$operator_setting" "$wiki_setting"
+    validate_configuration "$transaction_root/config.after" || fail 'rendered configuration is invalid' "$readonly_exit_validation"
+    if [ -f "$target_configuration_file" ] && cmp -s "$target_configuration_file" "$transaction_root/config.after"; then
+        printf '%s\n' 'Configuration already matches the requested state.'
+        return
+    fi
+    printf '%s\n' 'Intelli-Repo configuration proposal'
+    printf '  target: %s\n' "$target_configuration_file"
+    printf '  base-agent: %s\n' "$base_setting"
+    printf '  operator-agent: %s\n' "$operator_setting"
+    printf '  wiki-agent: %s\n' "$wiki_setting"
+    printf '%s\n' '  excluded: staging, commit, push, publication, substrate mutation, and unrelated files'
+    [ "$dry_run" -eq 0 ] || return 0
+    approve_proposal "$approved" 'Apply this configuration proposal? Type yes: '
+
+    rollback_root=$operations_root/$operation_id.rollback
+    [ ! -e "$rollback_root" ] || fail 'configuration operation identifier collision' "$readonly_exit_preflight"
+    mkdir -p "$rollback_root" || fail 'could not preserve configuration pre-state' "$readonly_exit_mutation"
+    if [ -f "$target_configuration_file" ]; then
+        cp -p "$target_configuration_file" "$rollback_root/repo-agent-config.yaml.before" || fail 'could not preserve configuration pre-state' "$readonly_exit_mutation"
+        config_existed=true
+    else
+        config_existed=false
+        : >"$rollback_root/configuration-was-absent"
+    fi
+    staged_configuration=$operations_root/$operation_id.config.pending
+    cp -p "$transaction_root/config.after" "$staged_configuration" || fail 'could not stage configuration' "$readonly_exit_mutation"
+    mv "$staged_configuration" "$target_configuration_file" || fail 'could not apply configuration atomically' "$readonly_exit_mutation"
+    if ! validate_configuration "$target_configuration_file"; then
+        if [ "$config_existed" = true ]; then cp -p "$rollback_root/repo-agent-config.yaml.before" "$target_configuration_file"; else rm -f -- "$target_configuration_file"; fi
+        fail 'configuration validation failed; pre-state restored' "$readonly_exit_validation"
+    fi
+    receipt_file=$operations_root/$operation_id.yaml
+    if ! { cat >"$receipt_file" <<EOF
+schema_version: 1
+operation: configure
+operation_id: "$operation_id"
+distribution_version: "$readonly_distribution_version"
+approval: "$approval_kind"
+result: "success"
+configuration_existed_before: "$config_existed"
+configuration_after_sha256: "$(digest_file "$target_configuration_file")"
+rollback_payload: "$operation_id.rollback"
+publication_performed: false
+EOF
+    }; then
+        if [ "$config_existed" = true ]; then cp -p "$rollback_root/repo-agent-config.yaml.before" "$target_configuration_file"; else rm -f -- "$target_configuration_file"; fi
+        fail 'could not record configuration evidence; pre-state restored' "$readonly_exit_validation"
+    fi
+    printf 'Configuration updated successfully. Operation: %s.yaml\n' "$operation_id"
+}
+
+acquire_update_command() {
+    target_version=$1
+    acquisition_root=$2
+    for artifact in intelli-repo PROVENANCE.yaml SHA256SUMS; do
+        artifact_source="$readonly_public_base/$target_version/$artifact"
+        curl -fsSL "$artifact_source" -o "$acquisition_root/$artifact" || fail "could not retrieve $artifact_source" "$readonly_exit_preflight"
+    done
+    chmod 0700 "$acquisition_root/intelli-repo"
+    chmod 0600 "$acquisition_root/PROVENANCE.yaml" "$acquisition_root/SHA256SUMS"
+    provenance_version=$(yaml_scalar distribution_version "$acquisition_root/PROVENANCE.yaml") || fail 'invalid update provenance' "$readonly_exit_preflight"
+    [ "$provenance_version" = "$target_version" ] || fail 'requested update version does not match provenance' "$readonly_exit_compatibility"
+    expected_paths='CHANGELOG.md LICENSE PROVENANCE.yaml README.md SECURITY.md install.sh intelli-repo'
+    checksum_paths=''
+    while IFS= read -r checksum_line || [ -n "$checksum_line" ]; do
+        printf '%s\n' "$checksum_line" | grep -Eq '^[0-9a-f]{64}  [A-Za-z0-9][A-Za-z0-9._-]*$' || fail 'invalid update SHA256SUMS syntax or path' "$readonly_exit_preflight"
+        checksum_digest=${checksum_line%%  *}
+        checksum_path=${checksum_line#*  }
+        case " $expected_paths " in *" $checksum_path "*) ;; *) fail "unexpected update checksum path: $checksum_path" "$readonly_exit_preflight" ;; esac
+        case " $checksum_paths " in *" $checksum_path "*) fail "duplicate update checksum path: $checksum_path" "$readonly_exit_preflight" ;; esac
+        checksum_paths="$checksum_paths $checksum_path"
+        if [ "$checksum_path" = intelli-repo ]; then
+            [ "$(digest_file "$acquisition_root/intelli-repo")" = "$checksum_digest" ] || fail 'immutable update command checksum mismatch' "$readonly_exit_preflight"
+        fi
+    done <"$acquisition_root/SHA256SUMS"
+    for expected_path in $expected_paths; do
+        case " $checksum_paths " in *" $expected_path "*) ;; *) fail "missing update checksum path: $expected_path" "$readonly_exit_preflight" ;; esac
+    done
+}
+
+restore_index_file() {
+    restore_repository=$1
+    restore_record=$2
+    restore_path=$3
+    if [ -s "$restore_record" ]; then
+        set -- $(sed -n '1p' "$restore_record")
+        git -C "$restore_repository" update-index --add --cacheinfo "$1,$2,$restore_path"
+    else
+        git -C "$restore_repository" update-index --force-remove -- "$restore_path" >/dev/null 2>&1 || true
+    fi
+}
+
+receipt_scalar() {
+    receipt_key=$1
+    receipt_file=$2
+    receipt_value=$(yaml_scalar "$receipt_key" "$receipt_file" 2>/dev/null || true)
+    [ -n "$receipt_value" ] || fail "rollback receipt field is missing or ambiguous: $receipt_key" "$readonly_exit_preflight"
+    printf '%s\n' "$receipt_value"
+}
+
+write_update_receipt() {
+    receipt_file=$1
+    receipt_operation=$2
+    receipt_result=$3
+    receipt_approval=$4
+    receipt_before_version=$5
+    receipt_after_version=$6
+    receipt_rollback_payload=$7
+    receipt_command_after=$8
+    receipt_make_after=$9
+    shift 9
+    receipt_modules_after=$1
+    receipt_modules_index_after=$2
+    receipt_config_after=$3
+    receipt_base_before=$4
+    receipt_operator_before=$5
+    receipt_wiki_before=$6
+    receipt_base_after=$7
+    receipt_operator_after=$8
+    receipt_wiki_after=$9
+    cat >"$receipt_file" <<EOF
+schema_version: 1
+operation: "$receipt_operation"
+operation_id: "${receipt_file##*/}"
+result: "$receipt_result"
+approval: "$receipt_approval"
+before_version: "$receipt_before_version"
+after_version: "$receipt_after_version"
+rollback_payload: "$receipt_rollback_payload"
+command_after_sha256: "$receipt_command_after"
+makefile_after_sha256: "$receipt_make_after"
+gitmodules_after_sha256: "$receipt_modules_after"
+gitmodules_index_after: "$receipt_modules_index_after"
+configuration_after_sha256: "$receipt_config_after"
+before_base_agent: "$receipt_base_before"
+before_operator_agent: "$receipt_operator_before"
+before_wiki_agent: "$receipt_wiki_before"
+after_base_agent: "$receipt_base_after"
+after_operator_agent: "$receipt_operator_after"
+after_wiki_agent: "$receipt_wiki_after"
+publication_performed: false
+EOF
+}
+
+apply_update_command() {
+    requested_repository=.
+    from_version=''
+    from_protocol=''
+    dry_run=0
+    approved=0
+    approval_kind=tty
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --repo) [ "$#" -ge 2 ] || fail '--repo requires a value'; requested_repository=$2; shift 2 ;;
+            --from-version) [ "$#" -ge 2 ] || fail '--from-version requires a value'; from_version=$2; shift 2 ;;
+            --from-protocol) [ "$#" -ge 2 ] || fail '--from-protocol requires a value'; from_protocol=$2; shift 2 ;;
+            --dry-run) dry_run=1; shift ;;
+            --yes) approved=1; approval_kind=explicit-yes; shift ;;
+            *) fail "unknown internal update argument: $1" ;;
+        esac
+    done
+    [ -n "$from_version" ] || fail 'internal update is missing its source version' "$readonly_exit_preflight"
+    [ "$from_protocol" = "$readonly_lifecycle_protocol" ] || fail "incompatible lifecycle protocol: source ${from_protocol:-missing}, target $readonly_lifecycle_protocol" "$readonly_exit_compatibility"
+    [ "$from_version" != "$readonly_distribution_version" ] || fail 'internal update target equals the installed version' "$readonly_exit_compatibility"
+    preflight_runtime
+    validate_bootstrap_evidence "$readonly_distribution_version"
+    resolve_installed_repository "$requested_repository"
+    current_command=$repository_root/.intelli-repo/bin/intelli-repo
+    [ "$("$current_command" version 2>/dev/null || true)" = "$from_version" ] || fail 'installed version changed during update acquisition' "$readonly_exit_compatibility"
+    "$current_command" doctor --repo "$repository_root" >/dev/null || fail 'installed state is unhealthy; run doctor before update' "$readonly_exit_validation"
+    validate_configuration "$repository_root/repo-agent-config.yaml" || fail 'configuration is incompatible with update' "$readonly_exit_compatibility"
+
+    before_base=$(index_commit "$repository_root" .intelli-repo/base-agent) || fail 'missing current base-agent pin' "$readonly_exit_validation"
+    before_operator=$(index_commit "$repository_root" .intelli-repo/operator-agent) || fail 'missing current operator-agent pin' "$readonly_exit_validation"
+    before_wiki=$(index_commit "$repository_root" .intelli-repo/wiki-agent) || fail 'missing current wiki-agent pin' "$readonly_exit_validation"
+    operation_id=$(date -u '+%Y%m%dT%H%M%SZ')-update-$$
+    operations_root=$repository_root/.intelli-repo/operations
+    rollback_name=$operation_id.rollback
+    rollback_root=$operations_root/$rollback_name
+    receipt_file=$operations_root/$operation_id.yaml
+    [ ! -e "$rollback_root" ] && [ ! -e "$receipt_file" ] || fail 'update operation identifier collision' "$readonly_exit_preflight"
+    transaction_root=$(mktemp -d "${TMPDIR:-/tmp}/intelli-repo-update.XXXXXX") || fail 'could not create update transaction' "$readonly_exit_preflight"
+    mkdir -p "$transaction_root/stage"
+    managed_make_region >"$transaction_root/make.region"
+    render_makefile "$repository_root/Makefile" "$transaction_root/Makefile.after" "$transaction_root/make.region"
+    cp -p "$repository_root/.gitmodules" "$transaction_root/gitmodules.working.after"
+    git -C "$repository_root" show :.gitmodules >"$transaction_root/gitmodules.index.after"
+    for component_record in \
+        "base-agent|$readonly_base_agent_commit|$base_agent_url" \
+        "operator-agent|$readonly_operator_agent_commit|$operator_agent_url" \
+        "wiki-agent|$readonly_wiki_agent_commit|$wiki_agent_url"
+    do
+        component=${component_record%%|*}
+        remainder=${component_record#*|}
+        component_commit=${remainder%%|*}
+        component_url=${remainder#*|}
+        component_path=.intelli-repo/$component
+        module_key=$(submodule_entry_for_path "$repository_root/.gitmodules" "$component_path") || fail "missing submodule metadata for $component" "$readonly_exit_validation"
+        git config -f "$transaction_root/gitmodules.working.after" "$module_key.url" "$component_url"
+        git config -f "$transaction_root/gitmodules.index.after" "$module_key.url" "$component_url"
+        git clone -q --no-checkout "$component_url" "$transaction_root/stage/$component" || fail "could not acquire $component" "$readonly_exit_preflight"
+        git -C "$transaction_root/stage/$component" checkout -q --detach "$component_commit" || fail "could not resolve exact $component commit" "$readonly_exit_compatibility"
+        [ "$(git -C "$transaction_root/stage/$component" rev-parse HEAD)" = "$component_commit" ] || fail "exact $component commit verification failed" "$readonly_exit_compatibility"
+    done
+
+    printf '%s\n' 'Intelli-Repo update proposal'
+    printf '  target: %s\n' "$repository_root"
+    printf '  distribution: %s -> %s\n' "$from_version" "$readonly_distribution_version"
+    printf '  base-agent: %s -> %s\n' "$before_base" "$readonly_base_agent_commit"
+    printf '  operator-agent: %s -> %s\n' "$before_operator" "$readonly_operator_agent_commit"
+    printf '  wiki-agent: %s -> %s\n' "$before_wiki" "$readonly_wiki_agent_commit"
+    printf '  rollback operation: %s.yaml\n' "$operation_id"
+    printf '%s\n' '  migrations: none required by this compatibility transition'
+    printf '%s\n' '  excluded: unrelated files/staging, commit, push, tag, publication, and PATH changes'
+    if [ "$dry_run" -eq 1 ]; then
+        case ${transaction_root##*/} in intelli-repo-update.??????) rm -rf -- "$transaction_root" ;; esac
+        return
+    fi
+    approve_proposal "$approved" 'Apply this exact update proposal? Type yes: '
+
+    mkdir -p "$rollback_root" || fail 'could not create durable rollback payload' "$readonly_exit_mutation"
+    cp -p "$current_command" "$rollback_root/intelli-repo.before"
+    cp -p "$repository_root/Makefile" "$rollback_root/Makefile.before"
+    cp -p "$repository_root/.gitmodules" "$rollback_root/gitmodules.working.before"
+    git -C "$repository_root" ls-files --stage -- .gitmodules >"$rollback_root/gitmodules.index.before"
+    if [ -f "$repository_root/repo-agent-config.yaml" ]; then
+        cp -p "$repository_root/repo-agent-config.yaml" "$rollback_root/repo-agent-config.yaml.before"
+    else
+        : >"$rollback_root/configuration-was-absent"
+    fi
+    transaction_active=1
+
+    rollback_failed_update() {
+        rollback_ok=1
+        for component in base-agent operator-agent wiki-agent; do
+            component_path=$repository_root/.intelli-repo/$component
+            case "$component_path" in "$repository_root/.intelli-repo/"*) rm -rf -- "$component_path" ;; *) rollback_ok=0 ;; esac
+            [ ! -d "$rollback_root/$component.before" ] || mv "$rollback_root/$component.before" "$component_path" || rollback_ok=0
+        done
+        cp -p "$rollback_root/intelli-repo.before" "$current_command" || rollback_ok=0
+        cp -p "$rollback_root/Makefile.before" "$repository_root/Makefile" || rollback_ok=0
+        cp -p "$rollback_root/gitmodules.working.before" "$repository_root/.gitmodules" || rollback_ok=0
+        restore_index_file "$repository_root" "$rollback_root/gitmodules.index.before" .gitmodules || rollback_ok=0
+        git -C "$repository_root" update-index --add --cacheinfo "160000,$before_base,.intelli-repo/base-agent" || rollback_ok=0
+        git -C "$repository_root" update-index --add --cacheinfo "160000,$before_operator,.intelli-repo/operator-agent" || rollback_ok=0
+        git -C "$repository_root" update-index --add --cacheinfo "160000,$before_wiki,.intelli-repo/wiki-agent" || rollback_ok=0
+        if [ -f "$rollback_root/repo-agent-config.yaml.before" ]; then cp -p "$rollback_root/repo-agent-config.yaml.before" "$repository_root/repo-agent-config.yaml" || rollback_ok=0; else rm -f -- "$repository_root/repo-agent-config.yaml"; fi
+        "$current_command" doctor --repo "$repository_root" >/dev/null 2>&1 || rollback_ok=0
+        [ "$rollback_ok" -eq 1 ]
+    }
+    cleanup_update() {
+        update_result=$?
+        trap - EXIT HUP INT TERM
+        if [ "$transaction_active" -eq 1 ]; then
+            failure_result=rolled-back
+            if ! rollback_failed_update; then failure_result=rollback-failed; update_result=$readonly_exit_rollback; fi
+            write_update_receipt "$receipt_file" update "$failure_result" "$approval_kind" "$from_version" "$readonly_distribution_version" "$rollback_name" '' '' '' '' '' "$before_base" "$before_operator" "$before_wiki" "$readonly_base_agent_commit" "$readonly_operator_agent_commit" "$readonly_wiki_agent_commit" || true
+            printf 'intelli-repo: update recovery evidence: %s\n' "${receipt_file##*/}" >&2
+        fi
+        case ${transaction_root##*/} in intelli-repo-update.??????) rm -rf -- "$transaction_root" ;; esac
+        exit "$update_result"
+    }
+    trap cleanup_update EXIT HUP INT TERM
+
+    for component in base-agent operator-agent wiki-agent; do
+        mv "$repository_root/.intelli-repo/$component" "$rollback_root/$component.before" || fail "could not preserve $component checkout" "$readonly_exit_mutation"
+        mv "$transaction_root/stage/$component" "$repository_root/.intelli-repo/$component" || fail "could not install $component checkout" "$readonly_exit_mutation"
+    done
+    cp -p "$0" "$current_command" || fail 'could not install updated command' "$readonly_exit_mutation"
+    chmod 0755 "$current_command"
+    cp -p "$transaction_root/Makefile.after" "$repository_root/Makefile" || fail 'could not update managed Makefile region' "$readonly_exit_mutation"
+    cp -p "$transaction_root/gitmodules.working.after" "$repository_root/.gitmodules" || fail 'could not update .gitmodules working state' "$readonly_exit_mutation"
+    modules_index_blob=$(git -C "$repository_root" hash-object -w --path=.gitmodules "$transaction_root/gitmodules.index.after") || fail 'could not create updated .gitmodules index object' "$readonly_exit_mutation"
+    git -C "$repository_root" update-index --add --cacheinfo "100644,$modules_index_blob,.gitmodules" || fail 'could not update .gitmodules index' "$readonly_exit_mutation"
+    git -C "$repository_root" update-index --add --cacheinfo "160000,$readonly_base_agent_commit,.intelli-repo/base-agent"
+    git -C "$repository_root" update-index --add --cacheinfo "160000,$readonly_operator_agent_commit,.intelli-repo/operator-agent"
+    git -C "$repository_root" update-index --add --cacheinfo "160000,$readonly_wiki_agent_commit,.intelli-repo/wiki-agent"
+    "$current_command" doctor --repo "$repository_root" >/dev/null || fail 'updated installation validation failed' "$readonly_exit_validation"
+
+    command_after=$(digest_file "$current_command")
+    make_after=$(digest_file "$repository_root/Makefile")
+    modules_after=$(digest_file "$repository_root/.gitmodules")
+    modules_index_after=$(git -C "$repository_root" rev-parse :.gitmodules)
+    if [ -f "$repository_root/repo-agent-config.yaml" ]; then config_after=$(digest_file "$repository_root/repo-agent-config.yaml"); else config_after=absent; fi
+    write_update_receipt "$receipt_file" update success "$approval_kind" "$from_version" "$readonly_distribution_version" "$rollback_name" "$command_after" "$make_after" "$modules_after" "$modules_index_after" "$config_after" "$before_base" "$before_operator" "$before_wiki" "$readonly_base_agent_commit" "$readonly_operator_agent_commit" "$readonly_wiki_agent_commit" || fail 'could not record update evidence' "$readonly_exit_validation"
+    transaction_active=0
+    trap - EXIT HUP INT TERM
+    case ${transaction_root##*/} in intelli-repo-update.??????) rm -rf -- "$transaction_root" ;; esac
+    printf 'Intelli-Repo updated successfully. Operation: %s\n' "${receipt_file##*/}"
+}
+
+rollback_update_command() {
+    repository_root=$1
+    requested_operation=$2
+    dry_run=$3
+    approved=$4
+    approval_kind=$5
+    case "$requested_operation" in ''|*[!A-Za-z0-9._-]*|*/*) fail 'rollback operation ID contains unsafe characters' "$readonly_exit_preflight" ;; esac
+    case "$requested_operation" in *.yaml) receipt_name=$requested_operation ;; *) receipt_name=$requested_operation.yaml ;; esac
+    operations_root=$repository_root/.intelli-repo/operations
+    receipt_file=$operations_root/$receipt_name
+    [ -f "$receipt_file" ] && [ ! -L "$receipt_file" ] || fail 'named update receipt does not exist' "$readonly_exit_preflight"
+    [ "$(receipt_scalar operation "$receipt_file")" = update ] || fail 'named receipt is not an update operation' "$readonly_exit_compatibility"
+    [ "$(receipt_scalar result "$receipt_file")" = success ] || fail 'only a successful update receipt can be rolled back' "$readonly_exit_compatibility"
+    before_version=$(receipt_scalar before_version "$receipt_file")
+    after_version=$(receipt_scalar after_version "$receipt_file")
+    rollback_name=$(receipt_scalar rollback_payload "$receipt_file")
+    case "$rollback_name" in ''|*[!A-Za-z0-9._-]*|*/*) fail 'rollback payload name is unsafe' "$readonly_exit_preflight" ;; esac
+    rollback_root=$operations_root/$rollback_name
+    [ -d "$rollback_root" ] && [ ! -L "$rollback_root" ] || fail 'rollback payload is missing' "$readonly_exit_preflight"
+    [ ! -e "$rollback_root/consumed-by" ] || fail 'rollback payload was already consumed' "$readonly_exit_compatibility"
+    for rollback_asset in intelli-repo.before Makefile.before gitmodules.working.before gitmodules.index.before base-agent.before operator-agent.before wiki-agent.before; do
+        [ -e "$rollback_root/$rollback_asset" ] && [ ! -L "$rollback_root/$rollback_asset" ] || fail "rollback payload is incomplete or symlinked: $rollback_asset" "$readonly_exit_preflight"
+    done
+    if [ -e "$rollback_root/repo-agent-config.yaml.before" ]; then
+        [ -f "$rollback_root/repo-agent-config.yaml.before" ] && [ ! -L "$rollback_root/repo-agent-config.yaml.before" ] || fail 'rollback configuration pre-state is invalid' "$readonly_exit_preflight"
+    else
+        [ -f "$rollback_root/configuration-was-absent" ] && [ ! -L "$rollback_root/configuration-was-absent" ] || fail 'rollback configuration absence marker is missing' "$readonly_exit_preflight"
+    fi
+    current_command=$repository_root/.intelli-repo/bin/intelli-repo
+    [ "$("$current_command" version 2>/dev/null || true)" = "$after_version" ] || fail 'installed version no longer matches the update receipt' "$readonly_exit_compatibility"
+    expected_make=$(receipt_scalar makefile_after_sha256 "$receipt_file")
+    expected_command=$(receipt_scalar command_after_sha256 "$receipt_file")
+    expected_modules=$(receipt_scalar gitmodules_after_sha256 "$receipt_file")
+    expected_modules_index=$(receipt_scalar gitmodules_index_after "$receipt_file")
+    expected_config=$(receipt_scalar configuration_after_sha256 "$receipt_file")
+    digest_valid "$expected_command" && digest_valid "$expected_make" && digest_valid "$expected_modules" || fail 'rollback receipt contains an invalid digest' "$readonly_exit_preflight"
+    [ "$(digest_file "$current_command")" = "$expected_command" ] || fail 'installed command changed after the named update; refusing rollback' "$readonly_exit_compatibility"
+    [ "$(digest_file "$repository_root/Makefile")" = "$expected_make" ] || fail 'Makefile changed after the named update; refusing rollback' "$readonly_exit_compatibility"
+    [ "$(digest_file "$repository_root/.gitmodules")" = "$expected_modules" ] || fail '.gitmodules changed after the named update; refusing rollback' "$readonly_exit_compatibility"
+    [ "$(git -C "$repository_root" rev-parse :.gitmodules)" = "$expected_modules_index" ] || fail 'staged .gitmodules changed after the named update; refusing rollback' "$readonly_exit_compatibility"
+    if [ -f "$repository_root/repo-agent-config.yaml" ]; then current_config=$(digest_file "$repository_root/repo-agent-config.yaml"); else current_config=absent; fi
+    if [ "$expected_config" != absent ]; then digest_valid "$expected_config" || fail 'rollback receipt contains an invalid configuration digest' "$readonly_exit_preflight"; fi
+    [ "$current_config" = "$expected_config" ] || fail 'configuration changed after the named update; refusing rollback' "$readonly_exit_compatibility"
+    before_base=$(receipt_scalar before_base_agent "$receipt_file")
+    before_operator=$(receipt_scalar before_operator_agent "$receipt_file")
+    before_wiki=$(receipt_scalar before_wiki_agent "$receipt_file")
+    after_base=$(receipt_scalar after_base_agent "$receipt_file")
+    after_operator=$(receipt_scalar after_operator_agent "$receipt_file")
+    after_wiki=$(receipt_scalar after_wiki_agent "$receipt_file")
+    for receipt_commit in "$before_base" "$before_operator" "$before_wiki" "$after_base" "$after_operator" "$after_wiki" "$expected_modules_index"; do
+        commit_valid "$receipt_commit" || fail 'rollback receipt contains an invalid Git object ID' "$readonly_exit_preflight"
+    done
+    semver_valid "$before_version" && semver_valid "$after_version" || fail 'rollback receipt contains an invalid version' "$readonly_exit_preflight"
+    [ "$(index_commit "$repository_root" .intelli-repo/base-agent 2>/dev/null || true)" = "$after_base" ] || fail 'base-agent pin changed after update' "$readonly_exit_compatibility"
+    [ "$(index_commit "$repository_root" .intelli-repo/operator-agent 2>/dev/null || true)" = "$after_operator" ] || fail 'operator-agent pin changed after update' "$readonly_exit_compatibility"
+    [ "$(index_commit "$repository_root" .intelli-repo/wiki-agent 2>/dev/null || true)" = "$after_wiki" ] || fail 'wiki-agent pin changed after update' "$readonly_exit_compatibility"
+    "$current_command" doctor --repo "$repository_root" >/dev/null || fail 'current installation is unhealthy; refusing rollback' "$readonly_exit_validation"
+
+    printf '%s\n' 'Intelli-Repo named rollback proposal'
+    printf '  target: %s\n' "$repository_root"
+    printf '  source operation: %s\n' "$receipt_name"
+    printf '  distribution: %s -> %s\n' "$after_version" "$before_version"
+    printf '  base-agent: %s -> %s\n' "$after_base" "$before_base"
+    printf '  operator-agent: %s -> %s\n' "$after_operator" "$before_operator"
+    printf '  wiki-agent: %s -> %s\n' "$after_wiki" "$before_wiki"
+    printf '%s\n' '  restore captured command, managed region, configuration state, and exact component checkouts'
+    printf '%s\n' '  excluded: unrelated files/staging, commit, push, tag, publication, and PATH changes'
+    [ "$dry_run" -eq 0 ] || return 0
+    approve_proposal "$approved" 'Apply this named rollback proposal? Type yes: '
+
+    operation_id=$(date -u '+%Y%m%dT%H%M%SZ')-rollback-$$
+    recovery_name=$operation_id.rollback
+    recovery_root=$operations_root/$recovery_name
+    recovery_receipt=$operations_root/$operation_id.yaml
+    [ ! -e "$recovery_root" ] && [ ! -e "$recovery_receipt" ] || fail 'rollback operation identifier collision' "$readonly_exit_preflight"
+    mkdir -p "$recovery_root" || fail 'could not create rollback recovery payload' "$readonly_exit_mutation"
+    cp -p "$current_command" "$recovery_root/intelli-repo.before"
+    cp -p "$repository_root/Makefile" "$recovery_root/Makefile.before"
+    cp -p "$repository_root/.gitmodules" "$recovery_root/gitmodules.working.before"
+    git -C "$repository_root" ls-files --stage -- .gitmodules >"$recovery_root/gitmodules.index.before"
+    if [ -f "$repository_root/repo-agent-config.yaml" ]; then cp -p "$repository_root/repo-agent-config.yaml" "$recovery_root/repo-agent-config.yaml.before"; else : >"$recovery_root/configuration-was-absent"; fi
+    rollback_active=1
+    restore_current_after_failed_rollback() {
+        restore_ok=1
+        for component in base-agent operator-agent wiki-agent; do
+            component_path=$repository_root/.intelli-repo/$component
+            [ ! -d "$component_path" ] || mv "$component_path" "$rollback_root/$component.before" || restore_ok=0
+            [ ! -d "$recovery_root/$component.before" ] || mv "$recovery_root/$component.before" "$component_path" || restore_ok=0
+        done
+        cp -p "$recovery_root/intelli-repo.before" "$current_command" || restore_ok=0
+        cp -p "$recovery_root/Makefile.before" "$repository_root/Makefile" || restore_ok=0
+        cp -p "$recovery_root/gitmodules.working.before" "$repository_root/.gitmodules" || restore_ok=0
+        restore_index_file "$repository_root" "$recovery_root/gitmodules.index.before" .gitmodules || restore_ok=0
+        git -C "$repository_root" update-index --add --cacheinfo "160000,$after_base,.intelli-repo/base-agent" || restore_ok=0
+        git -C "$repository_root" update-index --add --cacheinfo "160000,$after_operator,.intelli-repo/operator-agent" || restore_ok=0
+        git -C "$repository_root" update-index --add --cacheinfo "160000,$after_wiki,.intelli-repo/wiki-agent" || restore_ok=0
+        if [ -f "$recovery_root/repo-agent-config.yaml.before" ]; then cp -p "$recovery_root/repo-agent-config.yaml.before" "$repository_root/repo-agent-config.yaml" || restore_ok=0; else rm -f -- "$repository_root/repo-agent-config.yaml"; fi
+        "$current_command" doctor --repo "$repository_root" >/dev/null 2>&1 || restore_ok=0
+        [ "$restore_ok" -eq 1 ]
+    }
+    cleanup_rollback() {
+        rollback_result=$?
+        trap - EXIT HUP INT TERM
+        if [ "$rollback_active" -eq 1 ]; then
+            recovery_result=rolled-back
+            if ! restore_current_after_failed_rollback; then recovery_result=rollback-failed; rollback_result=$readonly_exit_rollback; fi
+            write_update_receipt "$recovery_receipt" update-rollback "$recovery_result" "$approval_kind" "$after_version" "$before_version" "$recovery_name" '' '' '' '' '' "$after_base" "$after_operator" "$after_wiki" "$before_base" "$before_operator" "$before_wiki" || true
+            printf 'intelli-repo: rollback recovery evidence: %s\n' "${recovery_receipt##*/}" >&2
+        fi
+        exit "$rollback_result"
+    }
+    trap cleanup_rollback EXIT HUP INT TERM
+
+    for component in base-agent operator-agent wiki-agent; do
+        mv "$repository_root/.intelli-repo/$component" "$recovery_root/$component.before" || fail "could not preserve current $component checkout" "$readonly_exit_mutation"
+        mv "$rollback_root/$component.before" "$repository_root/.intelli-repo/$component" || fail "could not restore $component checkout" "$readonly_exit_mutation"
+    done
+    cp -p "$rollback_root/intelli-repo.before" "$current_command" || fail 'could not restore prior command' "$readonly_exit_mutation"
+    chmod 0755 "$current_command"
+    cp -p "$rollback_root/Makefile.before" "$repository_root/Makefile" || fail 'could not restore prior Makefile' "$readonly_exit_mutation"
+    cp -p "$rollback_root/gitmodules.working.before" "$repository_root/.gitmodules" || fail 'could not restore prior .gitmodules' "$readonly_exit_mutation"
+    restore_index_file "$repository_root" "$rollback_root/gitmodules.index.before" .gitmodules || fail 'could not restore prior .gitmodules index' "$readonly_exit_mutation"
+    git -C "$repository_root" update-index --add --cacheinfo "160000,$before_base,.intelli-repo/base-agent"
+    git -C "$repository_root" update-index --add --cacheinfo "160000,$before_operator,.intelli-repo/operator-agent"
+    git -C "$repository_root" update-index --add --cacheinfo "160000,$before_wiki,.intelli-repo/wiki-agent"
+    if [ -e "$rollback_root/repo-agent-config.yaml.before" ]; then
+        [ -f "$rollback_root/repo-agent-config.yaml.before" ] && [ ! -L "$rollback_root/repo-agent-config.yaml.before" ] || fail 'rollback configuration pre-state is invalid' "$readonly_exit_preflight"
+        cp -p "$rollback_root/repo-agent-config.yaml.before" "$repository_root/repo-agent-config.yaml"
+    else
+        [ -f "$rollback_root/configuration-was-absent" ] && [ ! -L "$rollback_root/configuration-was-absent" ] || fail 'rollback configuration absence marker is missing' "$readonly_exit_preflight"
+        rm -f -- "$repository_root/repo-agent-config.yaml"
+    fi
+    "$current_command" doctor --repo "$repository_root" >/dev/null || fail 'restored installation validation failed' "$readonly_exit_validation"
+
+    restored_command=$(digest_file "$current_command")
+    restored_make=$(digest_file "$repository_root/Makefile")
+    restored_modules=$(digest_file "$repository_root/.gitmodules")
+    restored_modules_index=$(git -C "$repository_root" rev-parse :.gitmodules)
+    if [ -f "$repository_root/repo-agent-config.yaml" ]; then restored_config=$(digest_file "$repository_root/repo-agent-config.yaml"); else restored_config=absent; fi
+    write_update_receipt "$recovery_receipt" update-rollback success "$approval_kind" "$after_version" "$before_version" "$recovery_name" "$restored_command" "$restored_make" "$restored_modules" "$restored_modules_index" "$restored_config" "$after_base" "$after_operator" "$after_wiki" "$before_base" "$before_operator" "$before_wiki" || fail 'could not record rollback evidence' "$readonly_exit_validation"
+    printf '%s\n' "${recovery_receipt##*/}" >"$rollback_root/consumed-by"
+    rollback_active=0
+    trap - EXIT HUP INT TERM
+    printf 'Intelli-Repo rollback completed successfully. Operation: %s\n' "${recovery_receipt##*/}"
+}
+
+update_command() {
+    requested_repository=.
+    requested_version=''
+    requested_rollback=''
+    dry_run=0
+    approved=0
+    approval_kind=tty
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --repo) [ "$#" -ge 2 ] || fail '--repo requires a value'; requested_repository=$2; shift 2 ;;
+            --version) [ "$#" -ge 2 ] || fail '--version requires a value'; requested_version=$2; shift 2 ;;
+            --rollback) [ "$#" -ge 2 ] || fail '--rollback requires an operation ID'; requested_rollback=$2; shift 2 ;;
+            --dry-run) dry_run=1; shift ;;
+            --yes) approved=1; approval_kind=explicit-yes; shift ;;
+            --help|-h) printf '%s\n' 'Usage: intelli-repo update [--repo PATH] (--version VERSION | --rollback OPERATION_ID) [--dry-run] [--yes]'; return ;;
+            *) fail "unknown update argument: $1" ;;
+        esac
+    done
+    [ -z "$requested_version" ] || [ -z "$requested_rollback" ] || fail '--version and --rollback are mutually exclusive'
+    [ -n "$requested_version$requested_rollback" ] || fail 'update requires --version or --rollback'
+    preflight_runtime
+    resolve_installed_repository "$requested_repository"
+    if [ -n "$requested_rollback" ]; then
+        rollback_update_command "$repository_root" "$requested_rollback" "$dry_run" "$approved" "$approval_kind"
+        return
+    fi
+    semver_valid "$requested_version" || fail "invalid version: $requested_version"
+    installed_version=$("$repository_root/.intelli-repo/bin/intelli-repo" version 2>/dev/null || true)
+    [ "$installed_version" = "$readonly_distribution_version" ] || fail 'invoked command does not match the installed version' "$readonly_exit_compatibility"
+    if [ "$requested_version" = "$readonly_distribution_version" ]; then
+        "$repository_root/.intelli-repo/bin/intelli-repo" doctor --repo "$repository_root" >/dev/null || fail 'installed state is unhealthy' "$readonly_exit_validation"
+        printf 'Intelli-Repo %s is already installed exactly; no update required.\n' "$requested_version"
+        return
+    fi
+    acquisition_root=$(mktemp -d "${TMPDIR:-/tmp}/intelli-repo-update-acquire.XXXXXX") || fail 'could not create update acquisition directory' "$readonly_exit_preflight"
+    cleanup_acquisition() {
+        case ${acquisition_root##*/} in intelli-repo-update-acquire.??????) rm -rf -- "$acquisition_root" ;; esac
+    }
+    trap cleanup_acquisition EXIT HUP INT TERM
+    acquire_update_command "$requested_version" "$acquisition_root"
+    set -- _apply-update --repo "$repository_root" --from-version "$readonly_distribution_version" --from-protocol "$readonly_lifecycle_protocol"
+    [ "$dry_run" -eq 0 ] || set -- "$@" --dry-run
+    [ "$approved" -eq 0 ] || set -- "$@" --yes
+    INTELLI_REPO_BOOTSTRAP_VERSION=$requested_version \
+    INTELLI_REPO_BOOTSTRAP_PROVENANCE=$acquisition_root/PROVENANCE.yaml \
+    INTELLI_REPO_BOOTSTRAP_CHECKSUMS=$acquisition_root/SHA256SUMS \
+    INTELLI_REPO_BOOTSTRAP_SELECTION=explicit-update \
+        "$acquisition_root/intelli-repo" "$@"
+    trap - EXIT HUP INT TERM
+    cleanup_acquisition
+}
+
+uninstall_command() {
+    requested_repository=.
+    dry_run=0
+    approved=0
+    approval_kind=tty
+    purge_user_data=0
+    destructive_confirmation=''
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --repo) [ "$#" -ge 2 ] || fail '--repo requires a value'; requested_repository=$2; shift 2 ;;
+            --purge-user-data) purge_user_data=1; shift ;;
+            --confirm-purge) [ "$#" -ge 2 ] || fail '--confirm-purge requires DELETE-USER-DATA'; destructive_confirmation=$2; shift 2 ;;
+            --dry-run) dry_run=1; shift ;;
+            --yes) approved=1; approval_kind=explicit-yes; shift ;;
+            --help|-h) printf '%s\n' 'Usage: intelli-repo uninstall [--repo PATH] [--purge-user-data --confirm-purge DELETE-USER-DATA] [--dry-run] [--yes]'; return ;;
+            *) fail "unknown uninstall argument: $1" ;;
+        esac
+    done
+    [ "$purge_user_data" -eq 1 ] || [ -z "$destructive_confirmation" ] || fail '--confirm-purge is valid only with --purge-user-data'
+    case "$destructive_confirmation" in ''|DELETE-USER-DATA) ;; *) fail 'invalid purge confirmation; expected DELETE-USER-DATA' ;; esac
+
+    preflight_runtime
+    resolve_installed_repository "$requested_repository"
+    [ -z "$(find "$repository_root" -mindepth 1 -maxdepth 1 -name '.intelli-repo-uninstall-*.pending' -print -quit 2>/dev/null || true)" ] || fail 'an interrupted uninstall recovery bundle already exists; restore or remove it explicitly before retrying' "$readonly_exit_preflight"
+    validate_installation "$repository_root" || fail 'owned installation is altered or unhealthy; refusing conservative uninstall' "$readonly_exit_validation"
+    unexpected_substrate=$(find "$repository_root/.intelli-repo" -mindepth 1 -maxdepth 1 ! -name bin ! -name operations ! -name base-agent ! -name operator-agent ! -name wiki-agent -print -quit 2>/dev/null || true)
+    [ -z "$unexpected_substrate" ] || fail "unowned content exists inside the substrate boundary: ${unexpected_substrate##*/}" "$readonly_exit_compatibility"
+    unexpected_bin=$(find "$repository_root/.intelli-repo/bin" -mindepth 1 -maxdepth 1 ! -name intelli-repo -print -quit 2>/dev/null || true)
+    [ -z "$unexpected_bin" ] || fail "unrecognized installed utility: ${unexpected_bin##*/}" "$readonly_exit_compatibility"
+
+    operation_id=$(date -u '+%Y%m%dT%H%M%SZ')-uninstall-$$
+    transaction_root=$repository_root/.intelli-repo-uninstall-$operation_id.pending
+    [ ! -e "$transaction_root" ] || fail 'uninstall operation identifier collision' "$readonly_exit_preflight"
+    mkdir "$transaction_root" || fail 'could not create uninstall recovery bundle' "$readonly_exit_mutation"
+    chmod 0700 "$transaction_root" || fail 'could not protect uninstall recovery bundle' "$readonly_exit_mutation"
+    preflight_bundle_active=1
+    cleanup_uninstall_preflight() {
+        preflight_result=$?
+        trap - EXIT HUP INT TERM
+        if [ "$preflight_bundle_active" -eq 1 ]; then
+            case "$transaction_root" in "$repository_root"/.intelli-repo-uninstall-*.pending) rm -rf -- "$transaction_root" ;; esac
+        fi
+        exit "$preflight_result"
+    }
+    trap cleanup_uninstall_preflight EXIT HUP INT TERM
+    cp -p "$repository_root/Makefile" "$transaction_root/Makefile.before"
+    cp -p "$repository_root/.gitmodules" "$transaction_root/gitmodules.working.before"
+    git -C "$repository_root" show :.gitmodules >"$transaction_root/gitmodules.index.before"
+    git -C "$repository_root" ls-files --stage -- .gitmodules >"$transaction_root/gitmodules.index.record.before"
+    render_makefile_without_region "$repository_root/Makefile" "$transaction_root/Makefile.after"
+    remove_owned_module_sections "$repository_root/.gitmodules" "$transaction_root/gitmodules.working.after"
+    remove_owned_module_sections "$transaction_root/gitmodules.index.before" "$transaction_root/gitmodules.index.after"
+
+    for component_record in \
+        "base-agent|$readonly_base_agent_commit|$base_agent_url" \
+        "operator-agent|$readonly_operator_agent_commit|$operator_agent_url" \
+        "wiki-agent|$readonly_wiki_agent_commit|$wiki_agent_url"
+    do
+        component=${component_record%%|*}
+        remainder=${component_record#*|}
+        expected_commit=${remainder%%|*}
+        expected_url=${remainder#*|}
+        [ "$(index_commit "$repository_root" ".intelli-repo/$component" 2>/dev/null || true)" = "$expected_commit" ] || fail "owned gitlink is altered: $component" "$readonly_exit_compatibility"
+        validate_owned_module_section "$repository_root/.gitmodules" "$component" "$expected_url" || fail "working .gitmodules ownership check failed: $component" "$readonly_exit_compatibility"
+        validate_owned_module_section "$transaction_root/gitmodules.index.before" "$component" "$expected_url" || fail "staged .gitmodules ownership check failed: $component" "$readonly_exit_compatibility"
+        git -C "$repository_root" ls-files --stage -- ".intelli-repo/$component" >"$transaction_root/$component.index.before"
+        local_url=$(git -C "$repository_root" config --local --get "submodule.intelli-repo-$component.url" 2>/dev/null || true)
+        local_active=$(git -C "$repository_root" config --local --get "submodule.intelli-repo-$component.active" 2>/dev/null || true)
+        printf '%s\n' "$local_url" >"$transaction_root/$component.local-url.before"
+        printf '%s\n' "$local_active" >"$transaction_root/$component.local-active.before"
+    done
+
+    if [ "$purge_user_data" -eq 1 ]; then
+        [ ! -L "$repository_root/wiki" ] || fail 'symlinked purge target is prohibited: wiki' "$readonly_exit_preflight"
+        [ ! -L "$repository_root/workspace" ] || fail 'symlinked purge target is prohibited: workspace' "$readonly_exit_preflight"
+        [ ! -e "$repository_root/repo-agent-config.yaml" ] || [ -f "$repository_root/repo-agent-config.yaml" ] || fail 'purge target is not a regular configuration file' "$readonly_exit_preflight"
+        [ ! -e "$repository_root/wiki" ] || [ -d "$repository_root/wiki" ] || fail 'purge target is not a directory: wiki' "$readonly_exit_preflight"
+        [ ! -e "$repository_root/workspace" ] || [ -d "$repository_root/workspace" ] || fail 'purge target is not a directory: workspace' "$readonly_exit_preflight"
+    fi
+
+    printf '%s\n' 'Intelli-Repo uninstall proposal'
+    printf '  target: %s\n' "$repository_root"
+    printf '%s\n' '  remove exact owned substrate: .intelli-repo/'
+    printf '%s\n' '  remove exact owned gitlinks and .gitmodules sections: base-agent, operator-agent, wiki-agent'
+    printf '%s\n' '  remove exact managed region: Makefile'
+    printf '%s\n' '  preserve: repository history, unrelated files, unrelated staging, unrelated submodules, and bytes outside managed markers'
+    if [ "$purge_user_data" -eq 0 ]; then
+        printf '%s\n' '  preserve unchanged: repo-agent-config.yaml, wiki/, and workspace/'
+    else
+        printf '%s\n' '  destructive purge targets:'
+        [ ! -e "$repository_root/repo-agent-config.yaml" ] || printf '%s\n' '    repo-agent-config.yaml'
+        [ ! -e "$repository_root/wiki" ] || printf '%s\n' '    wiki/'
+        [ ! -e "$repository_root/workspace" ] || printf '%s\n' '    workspace/'
+        printf '%s\n' '  recovery: available during mutation; deleted user data is not recoverable from Intelli-Repo after success'
+    fi
+    if [ "$dry_run" -eq 1 ]; then
+        preflight_bundle_active=0
+        trap - EXIT HUP INT TERM
+        rm -rf -- "$transaction_root"
+        return 0
+    fi
+    approve_proposal "$approved" 'Apply this conservative uninstall proposal? Type yes: '
+    [ "$purge_user_data" -eq 0 ] || approve_destructive_purge "$destructive_confirmation"
+
+    preflight_bundle_active=0
+    trap - EXIT HUP INT TERM
+    transaction_active=1
+    substrate_moved=0
+    rollback_uninstall() {
+        rollback_ok=1
+        if [ "$substrate_moved" -eq 1 ]; then
+            [ ! -e "$repository_root/.intelli-repo" ] || rollback_ok=0
+            [ ! -d "$transaction_root/substrate" ] || mv "$transaction_root/substrate" "$repository_root/.intelli-repo" || rollback_ok=0
+        fi
+        for purge_path in repo-agent-config.yaml wiki workspace; do
+            if [ -e "$transaction_root/purge/$purge_path" ]; then
+                [ ! -e "$repository_root/$purge_path" ] || rollback_ok=0
+                mv "$transaction_root/purge/$purge_path" "$repository_root/$purge_path" || rollback_ok=0
+            fi
+        done
+        cp -p "$transaction_root/Makefile.before" "$repository_root/Makefile" || rollback_ok=0
+        cp -p "$transaction_root/gitmodules.working.before" "$repository_root/.gitmodules" || rollback_ok=0
+        restore_index_file "$repository_root" "$transaction_root/gitmodules.index.record.before" .gitmodules || rollback_ok=0
+        for component in base-agent operator-agent wiki-agent; do
+            restore_index_file "$repository_root" "$transaction_root/$component.index.before" ".intelli-repo/$component" || rollback_ok=0
+            git -C "$repository_root" config --local --remove-section "submodule.intelli-repo-$component" >/dev/null 2>&1 || true
+            local_url=$(sed -n '1p' "$transaction_root/$component.local-url.before")
+            local_active=$(sed -n '1p' "$transaction_root/$component.local-active.before")
+            [ -z "$local_url" ] || git -C "$repository_root" config --local "submodule.intelli-repo-$component.url" "$local_url" || rollback_ok=0
+            [ -z "$local_active" ] || git -C "$repository_root" config --local "submodule.intelli-repo-$component.active" "$local_active" || rollback_ok=0
+        done
+        validate_installation "$repository_root" || rollback_ok=0
+        [ "$rollback_ok" -eq 1 ]
+    }
+    cleanup_uninstall() {
+        uninstall_result=$?
+        trap - EXIT HUP INT TERM
+        if [ "$transaction_active" -eq 1 ]; then
+            if rollback_uninstall; then
+                printf 'intelli-repo: uninstall failed; installed state restored from %s\n' "${transaction_root##*/}" >&2
+            else
+                printf 'intelli-repo: uninstall recovery failed; recovery bundle retained at %s\n' "$transaction_root" >&2
+                exit "$readonly_exit_rollback"
+            fi
+        fi
+        if [ -d "$transaction_root" ]; then
+            case "$transaction_root" in "$repository_root"/.intelli-repo-uninstall-*.pending) rm -rf -- "$transaction_root" ;; esac
+        fi
+        exit "$uninstall_result"
+    }
+    trap cleanup_uninstall EXIT HUP INT TERM
+
+    cp -p "$transaction_root/Makefile.after" "$repository_root/Makefile" || fail 'could not remove managed Makefile region' "$readonly_exit_mutation"
+    if [ -s "$transaction_root/gitmodules.working.after" ]; then
+        cp -p "$transaction_root/gitmodules.working.after" "$repository_root/.gitmodules" || fail 'could not remove working .gitmodules integration' "$readonly_exit_mutation"
+    else
+        rm -f -- "$repository_root/.gitmodules"
+    fi
+    if [ -s "$transaction_root/gitmodules.index.after" ]; then
+        modules_index_blob=$(git -C "$repository_root" hash-object -w --path=.gitmodules "$transaction_root/gitmodules.index.after") || fail 'could not create uninstalled .gitmodules index object' "$readonly_exit_mutation"
+        git -C "$repository_root" update-index --add --cacheinfo "100644,$modules_index_blob,.gitmodules" || fail 'could not update .gitmodules index during uninstall' "$readonly_exit_mutation"
+    else
+        git -C "$repository_root" update-index --force-remove -- .gitmodules >/dev/null 2>&1 || fail 'could not remove .gitmodules from the index' "$readonly_exit_mutation"
+    fi
+    for component in base-agent operator-agent wiki-agent; do
+        git -C "$repository_root" update-index --force-remove -- ".intelli-repo/$component" >/dev/null 2>&1 || fail "could not remove $component gitlink" "$readonly_exit_mutation"
+        git -C "$repository_root" config --local --remove-section "submodule.intelli-repo-$component" >/dev/null 2>&1 || true
+    done
+    if [ "$purge_user_data" -eq 1 ]; then
+        mkdir "$transaction_root/purge"
+        for purge_path in repo-agent-config.yaml wiki workspace; do
+            [ ! -e "$repository_root/$purge_path" ] || mv "$repository_root/$purge_path" "$transaction_root/purge/$purge_path" || fail "could not stage purge target: $purge_path" "$readonly_exit_mutation"
+        done
+    fi
+    mv "$repository_root/.intelli-repo" "$transaction_root/substrate" || fail 'could not stage installed substrate removal' "$readonly_exit_mutation"
+    substrate_moved=1
+
+    [ ! -e "$repository_root/.intelli-repo" ] || fail 'installed substrate remains after uninstall' "$readonly_exit_validation"
+    [ -z "$(git -C "$repository_root" ls-files --stage -- .intelli-repo/base-agent .intelli-repo/operator-agent .intelli-repo/wiki-agent)" ] || fail 'owned gitlinks remain after uninstall' "$readonly_exit_validation"
+    [ "$(grep -Fc '# BEGIN INTELLI-REPO MANAGED v1' "$repository_root/Makefile" 2>/dev/null || true)" -eq 0 ] || fail 'managed Makefile region remains after uninstall' "$readonly_exit_validation"
+    for component in base-agent operator-agent wiki-agent; do
+        [ -z "$(submodule_entry_for_path "$repository_root/.gitmodules" ".intelli-repo/$component" 2>/dev/null || true)" ] || fail "owned .gitmodules entry remains after uninstall: $component" "$readonly_exit_validation"
+    done
+    if [ "$purge_user_data" -eq 1 ]; then
+        for purge_path in repo-agent-config.yaml wiki workspace; do [ ! -e "$repository_root/$purge_path" ] || fail "purge target remains: $purge_path" "$readonly_exit_validation"; done
+    fi
+
+    transaction_active=0
+    trap - EXIT HUP INT TERM
+    case "$transaction_root" in "$repository_root"/.intelli-repo-uninstall-*.pending) rm -rf -- "$transaction_root" ;; *) fail 'unsafe uninstall recovery cleanup path' "$readonly_exit_rollback" ;; esac
+    printf 'Intelli-Repo uninstalled successfully. Operation: %s\n' "$operation_id"
+    if [ "$purge_user_data" -eq 0 ]; then
+        printf '%s\n' 'User configuration and data were preserved unchanged.'
+    else
+        printf '%s\n' 'Purged repo-agent-config.yaml, wiki/, and workspace/ where present; Intelli-Repo recovery is no longer available.'
+    fi
+    printf '%s\n' 'Review the working tree and explicitly staged integration removals before committing.'
+}
+
+install_command() {
+    requested_repository=.
+    requested_version=$readonly_distribution_version
+    dry_run=0
+    approved=0
+    approval_kind=tty
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --repo) [ "$#" -ge 2 ] || fail '--repo requires a value'; requested_repository=$2; shift 2 ;;
+            --version) [ "$#" -ge 2 ] || fail '--version requires a value'; requested_version=$2; shift 2 ;;
+            --dry-run) dry_run=1; shift ;;
+            --yes) approved=1; approval_kind=explicit-yes; shift ;;
+            --help|-h) printf '%s\n' 'Usage: intelli-repo install [--repo PATH] [--version VERSION] [--dry-run] [--yes]'; return ;;
+            *) fail "unknown install argument: $1" ;;
+        esac
+    done
+
+    semver_valid "$requested_version" || fail "invalid version: $requested_version"
+    [ "$requested_version" = "$readonly_distribution_version" ] || fail "command version $readonly_distribution_version cannot install $requested_version" "$readonly_exit_compatibility"
+    preflight_runtime
+    validate_bootstrap_evidence "$requested_version"
+
+    base_agent_url=$readonly_base_agent_url
+    operator_agent_url=$readonly_operator_agent_url
+    wiki_agent_url=$readonly_wiki_agent_url
+    selection_context=${INTELLI_REPO_BOOTSTRAP_SELECTION:-direct-command}
+    canonical_request=$(canonical_requested_path "$requested_repository") || fail 'target path cannot be resolved through an existing parent' "$readonly_exit_preflight"
+    case "$canonical_request" in /) fail 'filesystem root cannot be an installation target' "$readonly_exit_preflight" ;; esac
+
+    new_repository=false
+    if [ -d "$canonical_request" ]; then
+        if repository_root=$(find_repository_root "$canonical_request"); then
+            repository_root=$(CDPATH= cd -- "$repository_root" && pwd -P)
+        else
+            repository_root=$canonical_request
+            new_repository=true
+            [ -z "$(find "$repository_root" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] || fail 'non-Git target directory must be empty' "$readonly_exit_preflight"
+        fi
+    else
+        repository_root=$canonical_request
+        new_repository=true
+    fi
+
+    if [ -n "${HOME:-}" ] && [ -d "$HOME" ]; then
+        canonical_user_home=$(CDPATH= cd -- "$HOME" && pwd -P)
+        [ "$repository_root" != "$canonical_user_home" ] || fail 'the user home directory cannot be an installation boundary' "$readonly_exit_preflight"
+    fi
+    for boundary_path in .intelli-repo .gitmodules Makefile wiki wiki/capabilities workspace; do
+        [ ! -L "$repository_root/$boundary_path" ] || fail "symlinked managed boundary is prohibited: $boundary_path" "$readonly_exit_preflight"
+    done
+
+    if [ "$new_repository" = false ] && validate_installation "$repository_root"; then
+        printf 'Intelli-Repo %s is already installed exactly at %s\n' "$readonly_distribution_version" "$repository_root"
+        return
+    fi
+    if [ -e "$repository_root/.intelli-repo" ]; then
+        unexpected=$(find "$repository_root/.intelli-repo" -mindepth 1 -maxdepth 1 ! -name operations -print -quit 2>/dev/null || true)
+        [ -z "$unexpected" ] || fail 'existing or partial .intelli-repo installation requires recovery before install' "$readonly_exit_preflight"
+    fi
+    for target_path in .intelli-repo/base-agent .intelli-repo/operator-agent .intelli-repo/wiki-agent; do
+        [ -z "$(git -C "$repository_root" ls-files --stage -- "$target_path" 2>/dev/null || true)" ] || fail "index collision: $target_path" "$readonly_exit_preflight"
+    done
+    if [ "$new_repository" = false ]; then
+        [ -z "$(git -C "$repository_root" diff --cached --diff-filter=D --name-only -- .gitmodules)" ] || fail 'staged .gitmodules deletion must be resolved before install' "$readonly_exit_preflight"
+    fi
+    if [ -f "$repository_root/.gitmodules" ]; then
+        for component in base-agent operator-agent wiki-agent; do
+            module_name=intelli-repo-$component
+            component_path=.intelli-repo/$component
+            [ -z "$(git config -f "$repository_root/.gitmodules" --get "submodule.$module_name.path" 2>/dev/null || true)" ] || fail "submodule-name collision: $module_name" "$readonly_exit_preflight"
+            [ -z "$(submodule_entry_for_path "$repository_root/.gitmodules" "$component_path" 2>/dev/null || true)" ] || fail "submodule-path collision: $component_path" "$readonly_exit_preflight"
+        done
+    fi
+
+    if [ "$new_repository" = false ]; then
+        staged_count=$(git -C "$repository_root" diff --cached --name-only | wc -l | tr -d ' ')
+        unstaged_count=$(git -C "$repository_root" diff --name-only | wc -l | tr -d ' ')
+        untracked_count=$(git -C "$repository_root" ls-files --others --exclude-standard | wc -l | tr -d ' ')
+        ignored_count=$(git -C "$repository_root" ls-files --others --ignored --exclude-standard | wc -l | tr -d ' ')
+        existing_submodule_count=$(git -C "$repository_root" submodule status 2>/dev/null | wc -l | tr -d ' ')
+    else
+        staged_count=0; unstaged_count=0; untracked_count=0; ignored_count=0; existing_submodule_count=0
+    fi
+
+    transaction_root=$(mktemp -d "${TMPDIR:-/tmp}/intelli-repo-install.XXXXXX") || fail 'could not create transaction directory' "$readonly_exit_preflight"
+    transaction_active=0
+    mutation_started=0
+    initialized_repository=0
+    makefile_existed=0
+    modules_existed=0
+    wiki_existed=0
+    capabilities_existed=0
+    workspace_existed=0
+    created_capability_dirs=''
+    [ ! -d "$repository_root/wiki" ] || wiki_existed=1
+    [ ! -d "$repository_root/wiki/capabilities" ] || capabilities_existed=1
+    [ ! -d "$repository_root/workspace" ] || workspace_existed=1
+    for capability_directory in policies skills tests tools; do
+        [ -d "$repository_root/wiki/capabilities/$capability_directory" ] || created_capability_dirs="$created_capability_dirs $capability_directory"
+    done
+    mkdir -p "$transaction_root/stage"
+    [ ! -e "$repository_root/Makefile" ] || { cp -p "$repository_root/Makefile" "$transaction_root/Makefile.before"; makefile_existed=1; }
+    [ ! -e "$repository_root/.gitmodules" ] || { cp -p "$repository_root/.gitmodules" "$transaction_root/gitmodules.before"; modules_existed=1; }
+    git -C "$repository_root" ls-files --stage -- .gitmodules >"$transaction_root/gitmodules.index.before" 2>/dev/null || true
+    if [ -s "$transaction_root/gitmodules.index.before" ]; then
+        git -C "$repository_root" show :.gitmodules >"$transaction_root/gitmodules.index.after"
+    else
+        : >"$transaction_root/gitmodules.index.after"
+    fi
+    if [ "$modules_existed" -eq 1 ]; then
+        cp -p "$transaction_root/gitmodules.before" "$transaction_root/gitmodules.working.after"
+    else
+        : >"$transaction_root/gitmodules.working.after"
+    fi
+    managed_make_region >"$transaction_root/make.region"
+    render_makefile "$repository_root/Makefile" "$transaction_root/Makefile.after" "$transaction_root/make.region"
+
+    rollback_install() {
+        [ "$mutation_started" -eq 1 ] || return 0
+        for rollback_path in .intelli-repo/base-agent .intelli-repo/operator-agent .intelli-repo/wiki-agent; do
+            git -C "$repository_root" submodule deinit -f -- "$rollback_path" >/dev/null 2>&1 || true
+            git -C "$repository_root" update-index --force-remove -- "$rollback_path" >/dev/null 2>&1 || true
+            case "$repository_root/$rollback_path" in "$repository_root/.intelli-repo/"*) rm -rf -- "$repository_root/$rollback_path" ;; esac
+        done
+        rm -f -- "$repository_root/.intelli-repo/bin/intelli-repo"
+        if [ "$makefile_existed" -eq 1 ]; then cp -p "$transaction_root/Makefile.before" "$repository_root/Makefile"; else rm -f -- "$repository_root/Makefile"; fi
+        if [ "$modules_existed" -eq 1 ]; then cp -p "$transaction_root/gitmodules.before" "$repository_root/.gitmodules"; else rm -f -- "$repository_root/.gitmodules"; fi
+        if [ -s "$transaction_root/gitmodules.index.before" ]; then
+            set -- $(sed -n '1p' "$transaction_root/gitmodules.index.before")
+            git -C "$repository_root" update-index --add --cacheinfo "$1,$2,.gitmodules" >/dev/null 2>&1 || true
+        else
+            git -C "$repository_root" update-index --force-remove -- .gitmodules >/dev/null 2>&1 || true
+        fi
+        for capability_directory in $created_capability_dirs; do rmdir "$repository_root/wiki/capabilities/$capability_directory" 2>/dev/null || true; done
+        if [ "$capabilities_existed" -eq 0 ]; then rmdir "$repository_root/wiki/capabilities" 2>/dev/null || true; fi
+        if [ "$wiki_existed" -eq 0 ]; then rmdir "$repository_root/wiki" 2>/dev/null || true; fi
+        if [ "$workspace_existed" -eq 0 ]; then rmdir "$repository_root/workspace" 2>/dev/null || true; fi
+        rmdir "$repository_root/.intelli-repo/bin" "$repository_root/.intelli-repo/operations" "$repository_root/.intelli-repo" 2>/dev/null || true
+        if [ "$initialized_repository" -eq 1 ]; then
+            printf 'intelli-repo: initialized Git repository retained for recoverability at %s\n' "$repository_root" >&2
+        fi
+        rollback_ok=1
+        for rollback_path in .intelli-repo/base-agent .intelli-repo/operator-agent .intelli-repo/wiki-agent; do
+            [ ! -e "$repository_root/$rollback_path" ] || rollback_ok=0
+            [ -z "$(git -C "$repository_root" ls-files --stage -- "$rollback_path" 2>/dev/null || true)" ] || rollback_ok=0
+        done
+        if [ "$makefile_existed" -eq 1 ]; then cmp -s "$transaction_root/Makefile.before" "$repository_root/Makefile" || rollback_ok=0; else [ ! -e "$repository_root/Makefile" ] || rollback_ok=0; fi
+        if [ "$modules_existed" -eq 1 ]; then cmp -s "$transaction_root/gitmodules.before" "$repository_root/.gitmodules" || rollback_ok=0; else [ ! -e "$repository_root/.gitmodules" ] || rollback_ok=0; fi
+        [ "$rollback_ok" -eq 1 ]
+    }
+
+    cleanup_transaction() {
+        result=$?
+        trap - EXIT HUP INT TERM
+        if [ "$transaction_active" -eq 1 ]; then
+            receipt_result=rolled-back
+            if ! rollback_install; then
+                receipt_result=rollback-failed
+                result=$readonly_exit_rollback
+            fi
+            failure_operation_id=$(date -u '+%Y%m%dT%H%M%SZ')-install-failed-$$.yaml
+            write_receipt "$repository_root/.intelli-repo/operations/$failure_operation_id" "$receipt_result" "$approval_kind" "$selection_context" "$new_repository" || true
+            printf 'intelli-repo: rollback evidence: %s\n' "$failure_operation_id" >&2
+        fi
+        case ${transaction_root##*/} in intelli-repo-install.??????) rm -rf -- "$transaction_root" ;; esac
+        exit "$result"
+    }
+    trap cleanup_transaction EXIT HUP INT TERM
+
+    printf '%s\n' 'Intelli-Repo installation proposal'
+    printf '  target: %s\n' "$repository_root"
+    printf '  distribution: %s (%s)\n' "$readonly_distribution_version" "$selection_context"
+    printf '  initialize Git repository: %s\n' "$new_repository"
+    printf '  inspected state: staged=%s unstaged=%s untracked=%s ignored=%s existing-submodules=%s\n' "$staged_count" "$unstaged_count" "$untracked_count" "$ignored_count" "$existing_submodule_count"
+    printf '  optional Make: %s\n' "$make_status"
+    printf '%s\n' '  install exact submodules:'
+    printf '    .intelli-repo/base-agent @ %s from %s\n' "$readonly_base_agent_commit" "$base_agent_url"
+    printf '    .intelli-repo/operator-agent @ %s from %s\n' "$readonly_operator_agent_commit" "$operator_agent_url"
+    printf '    .intelli-repo/wiki-agent @ %s from %s\n' "$readonly_wiki_agent_commit" "$wiki_agent_url"
+    printf '%s\n' '  install command: .intelli-repo/bin/intelli-repo'
+    printf '%s\n' '  update managed region: Makefile'
+    printf '%s\n' '  create user-owned directories if absent: wiki/capabilities/{policies,skills,tests,tools}, workspace'
+    printf '%s\n' '  configuration: repo-agent-config.yaml remains absent or unchanged'
+    printf '%s\n' '  Git effects: update and stage .gitmodules, stage three exact gitlinks, and register local submodule configuration'
+    printf '%s\n' '  excluded: commit, push, tag, publish, PATH changes, and unrelated staging'
+
+    if [ "$dry_run" -eq 1 ]; then transaction_active=0; return; fi
+    approve_proposal "$approved" 'Apply this exact installation proposal? Type yes: '
+
+    for component_record in \
+        "base-agent|$readonly_base_agent_commit|$base_agent_url" \
+        "operator-agent|$readonly_operator_agent_commit|$operator_agent_url" \
+        "wiki-agent|$readonly_wiki_agent_commit|$wiki_agent_url"
+    do
+        component=${component_record%%|*}
+        remainder=${component_record#*|}
+        component_commit=${remainder%%|*}
+        component_url=${remainder#*|}
+        git clone -q --no-checkout "$component_url" "$transaction_root/stage/$component" || fail "could not clone $component" "$readonly_exit_preflight"
+        git -C "$transaction_root/stage/$component" checkout -q --detach "$component_commit" || fail "could not resolve exact $component commit" "$readonly_exit_compatibility"
+        [ "$(git -C "$transaction_root/stage/$component" rev-parse HEAD)" = "$component_commit" ] || fail "exact $component commit verification failed" "$readonly_exit_compatibility"
+    done
+
+    if [ "$new_repository" = true ]; then
+        mkdir -p "$repository_root"
+        git -C "$repository_root" init -q || fail 'could not initialize Git repository' "$readonly_exit_mutation"
+        initialized_repository=1
+    fi
+    transaction_active=1
+    mutation_started=1
+    mkdir -p "$repository_root/.intelli-repo/bin" "$repository_root/.intelli-repo/operations" || fail 'could not create installed substrate directories' "$readonly_exit_mutation"
+    cp -p "$0" "$repository_root/.intelli-repo/bin/intelli-repo" || fail 'could not install command facade' "$readonly_exit_mutation"
+    chmod 0755 "$repository_root/.intelli-repo/bin/intelli-repo" || fail 'could not set command mode' "$readonly_exit_mutation"
+    cp -p "$transaction_root/Makefile.after" "$repository_root/Makefile" || fail 'could not update managed Makefile region' "$readonly_exit_mutation"
+    mkdir -p "$repository_root/wiki/capabilities/policies" "$repository_root/wiki/capabilities/skills" "$repository_root/wiki/capabilities/tests" "$repository_root/wiki/capabilities/tools" "$repository_root/workspace" || fail 'could not create convention-first user directories' "$readonly_exit_mutation"
+
+    for component_record in \
+        "base-agent|$readonly_base_agent_commit|$base_agent_url" \
+        "operator-agent|$readonly_operator_agent_commit|$operator_agent_url" \
+        "wiki-agent|$readonly_wiki_agent_commit|$wiki_agent_url"
+    do
+        component=${component_record%%|*}
+        remainder=${component_record#*|}
+        component_commit=${remainder%%|*}
+        component_url=${remainder#*|}
+        component_path=.intelli-repo/$component
+        module_name=intelli-repo-$component
+        git config -f "$transaction_root/gitmodules.working.after" "submodule.$module_name.path" "$component_path" || fail "could not prepare $component working-tree metadata" "$readonly_exit_mutation"
+        git config -f "$transaction_root/gitmodules.working.after" "submodule.$module_name.url" "$component_url" || fail "could not prepare $component working-tree URL" "$readonly_exit_mutation"
+        git config -f "$transaction_root/gitmodules.index.after" "submodule.$module_name.path" "$component_path" || fail "could not prepare $component index metadata" "$readonly_exit_mutation"
+        git config -f "$transaction_root/gitmodules.index.after" "submodule.$module_name.url" "$component_url" || fail "could not prepare $component index URL" "$readonly_exit_mutation"
+        mv "$transaction_root/stage/$component" "$repository_root/$component_path" || fail "could not install $component checkout" "$readonly_exit_mutation"
+        git -C "$repository_root" update-index --add --cacheinfo "160000,$component_commit,$component_path" || fail "could not stage exact $component gitlink" "$readonly_exit_mutation"
+    done
+    cp -p "$transaction_root/gitmodules.working.after" "$repository_root/.gitmodules" || fail 'could not update .gitmodules working tree' "$readonly_exit_mutation"
+    modules_index_blob=$(git -C "$repository_root" hash-object -w --path=.gitmodules "$transaction_root/gitmodules.index.after") || fail 'could not create .gitmodules index object' "$readonly_exit_mutation"
+    git -C "$repository_root" update-index --add --cacheinfo "100644,$modules_index_blob,.gitmodules" || fail 'could not stage .gitmodules integration' "$readonly_exit_mutation"
+    git -C "$repository_root" submodule init -- .intelli-repo/base-agent .intelli-repo/operator-agent .intelli-repo/wiki-agent >/dev/null 2>&1 || fail 'could not register installed submodules' "$readonly_exit_mutation"
+
+    validate_installation "$repository_root" || fail 'installed runtime validation failed' "$readonly_exit_validation"
+    operation_id=$(date -u '+%Y%m%dT%H%M%SZ')-install-$$.yaml
+    write_receipt "$repository_root/.intelli-repo/operations/$operation_id" success "$approval_kind" "$selection_context" "$new_repository" || fail 'could not record installation evidence' "$readonly_exit_validation"
+    transaction_active=0
+    printf 'Intelli-Repo %s installed successfully. Operation: %s\n' "$readonly_distribution_version" "$operation_id"
+    printf '%s\n' 'Review the explicitly staged .gitmodules and submodule gitlinks before committing.'
+}
+
+dispatch_capability() {
+    command_name=$1
+    shift
+    repository_path=${INTELLI_REPO_REPOSITORY:-.}
+    repository_root=$(find_repository_root "$repository_path") || fail 'target is not a Git worktree' "$readonly_exit_preflight"
+    handler="$repository_root/.intelli-repo/operator-agent/bin/intelli-repo-$command_name"
+    [ -x "$handler" ] || fail "installed capability does not provide command: $command_name" "$readonly_exit_compatibility"
+    exec "$handler" "$@"
+}
+
+command_name=${1:-help}
+[ "$#" -eq 0 ] || shift
+case "$command_name" in
+    help|-h|--help) usage ;;
+    version|-V|--version) printf '%s\n' "$readonly_distribution_version" ;;
+    install) install_command "$@" ;;
+    configure) configure_command "$@" ;;
+    update) update_command "$@" ;;
+    doctor) doctor_command "$@" ;;
+    uninstall) uninstall_command "$@" ;;
+    _apply-update) apply_update_command "$@" ;;
+    lint|audit|ingest|task|release) dispatch_capability "$command_name" "$@" ;;
+    *) usage >&2; fail "unknown command: $command_name" ;;
+esac

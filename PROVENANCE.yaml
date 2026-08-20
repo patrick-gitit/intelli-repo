@@ -1,0 +1,10 @@
+schema_version: 1
+distribution_version: "v0.1.0-beta.1"
+source_revision: "2381b93fc4a73a4995c84031930b39e8c9f24b87"
+installer_revision: "2381b93fc4a73a4995c84031930b39e8c9f24b87"
+installer_sha256: "884876113d3ce436a3cbfa517f9ea7481848862f79abf955e124b9ebbb747d7b"
+components:
+  base_agent: "9b3eec9f0566da3ace5ab0cb47d4c5a2dc1d9b0a"
+  operator_agent: "e8aec0e5f88af5624aa12f37656c9ef7243f70ca"
+  wiki_agent: "3543fdb11791fd2298c62bb41301bec628768501"
+authority: "Git commits, exact gitlinks, and immutable annotated tags"
