@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-readonly_distribution_version='v0.1.0-beta.2'
+readonly_distribution_version='v0.1.0-beta.2.1'
 readonly_base_agent_commit='a6d697c28238f2c2b3f5bbf3ce24f39e39c4ccaf'
 readonly_operator_agent_commit='49175ac1f1a7bf1e57c74d2d34c9567c916102d5'
 readonly_wiki_agent_commit='a6d2ebfb6cfb78076ad6d06dc87f1aed7ce57ab9'

@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-readonly_default_version='v0.1.0-beta.2'
+readonly_default_version='v0.1.0-beta.2.1'
 readonly_public_base='https://raw.githubusercontent.com/patrick-gitit/intelli-repo'
 
 fail() {
@@ -90,12 +90,13 @@ chmod 0600 "$bootstrap_directory/PROVENANCE.yaml" "$bootstrap_directory/SHA256SU
 provenance_version=$(yaml_scalar distribution_version "$bootstrap_directory/PROVENANCE.yaml")
 [ "$provenance_version" = "$version" ] || fail 'selected version does not match immutable provenance' 65
 
-expected_paths='CHANGELOG.md LICENSE PROVENANCE.yaml README.md SECURITY.md install.sh intelli-repo'
+expected_paths="CHANGELOG.md LICENSE PROVENANCE.yaml README.md SECURITY.md install.sh intelli-repo readme-banner.png release-notes/$version.md"
 checksum_paths=''
 while IFS= read -r checksum_line || [ -n "$checksum_line" ]; do
-    printf '%s\n' "$checksum_line" | grep -Eq '^[0-9a-f]{64}  [A-Za-z0-9][A-Za-z0-9._-]*$' || fail 'invalid SHA256SUMS syntax or path' 65
+    printf '%s\n' "$checksum_line" | grep -Eq '^[0-9a-f]{64}  [A-Za-z0-9][A-Za-z0-9._/-]*$' || fail 'invalid SHA256SUMS syntax or path' 65
     checksum_digest=${checksum_line%%  *}
     checksum_path=${checksum_line#*  }
+    case "$checksum_path" in /*|../*|*/../*|*/..|*//*|*/./*|*/.) fail "unsafe checksum path: $checksum_path" 65 ;; esac
     case " $expected_paths " in *" $checksum_path "*) ;; *) fail "unexpected checksum path: $checksum_path" 65 ;; esac
     case " $checksum_paths " in *" $checksum_path "*) fail "duplicate checksum path: $checksum_path" 65 ;; esac
     checksum_paths="$checksum_paths $checksum_path"

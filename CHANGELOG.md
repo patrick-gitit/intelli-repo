@@ -4,6 +4,11 @@ All notable user-visible changes to Intelli-Repo are documented here. Versions f
 
 ## Unreleased
 
+## v0.1.0-beta.2.1 — 2026-08-26
+
+### Highlights
+
+- The stable and immutable bootstraps now accept and verify the generated banner and versioned release-note checksum entries instead of rejecting their own release manifest.
 ## v0.1.0-beta.2 — 2026-08-26
 
 ### Highlights
@@ -14,6 +19,7 @@ All notable user-visible changes to Intelli-Repo are documented here. Versions f
 - Compatible beta.1 updates backfill missing scaffold paths and preserve later user additions during rollback.
 - Release notes, checksums, and provenance can be projected into a separately approved GitHub prerelease without allowing the hosting interface to mutate Git refs.
 - Linux users can explicitly select a repository-local .intelli-repo/.env provider, retrieve one named value through a bounded consumer, and check readiness without exposing the value. Windows and macOS support remain unavailable pending future validation.
+
 ## v0.1.0-beta.1 — 2026-08-20
 
 First public beta of the exact-pinned Intelli-Repo agent substrate and repository-local lifecycle tooling.
