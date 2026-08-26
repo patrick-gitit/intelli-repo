@@ -1,10 +1,13 @@
 #!/bin/sh
 set -eu
 
-readonly_distribution_version='v0.1.0-beta.1'
-readonly_base_agent_commit='9b3eec9f0566da3ace5ab0cb47d4c5a2dc1d9b0a'
-readonly_operator_agent_commit='e8aec0e5f88af5624aa12f37656c9ef7243f70ca'
-readonly_wiki_agent_commit='3543fdb11791fd2298c62bb41301bec628768501'
+readonly_distribution_version='v0.1.0-beta.2'
+readonly_base_agent_commit='a6d697c28238f2c2b3f5bbf3ce24f39e39c4ccaf'
+readonly_operator_agent_commit='49175ac1f1a7bf1e57c74d2d34c9567c916102d5'
+readonly_wiki_agent_commit='a6d2ebfb6cfb78076ad6d06dc87f1aed7ce57ab9'
+readonly_supported_beta_1_base_agent_commit='9b3eec9f0566da3ace5ab0cb47d4c5a2dc1d9b0a'
+readonly_supported_beta_1_operator_agent_commit='e8aec0e5f88af5624aa12f37656c9ef7243f70ca'
+readonly_supported_beta_1_wiki_agent_commit='3543fdb11791fd2298c62bb41301bec628768501'
 readonly_base_agent_url='https://github.com/patrick-gitit/irp_base-agent.git'
 readonly_operator_agent_url='https://github.com/patrick-gitit/irp_operator-agent.git'
 readonly_wiki_agent_url='https://github.com/patrick-gitit/irp_wiki-agent.git'
@@ -45,8 +48,9 @@ Global commands:
 
 Common options are --repo PATH, --dry-run, and --yes. Install accepts --version
 VERSION. Update requires either --version VERSION or --rollback OPERATION_ID.
-Configure accepts repeatable --set-agent NAME=enabled|disabled. Uninstall
-accepts --purge-user-data only through its separate confirmation contract.
+Configure accepts repeatable --set-agent NAME=enabled|disabled plus explicit
+--set-secret-provider none|dotenv and --set-secret-name NAME. Uninstall accepts
+--purge-user-data only through its separate confirmation contract.
 USAGE
 }
 
@@ -119,7 +123,11 @@ configuration_value() {
         printf '%s\n' "$configuration_default"
         return
     fi
-    yaml_scalar "$configuration_key" "$configuration_file"
+    if configuration_result=$(yaml_scalar "$configuration_key" "$configuration_file" 2>/dev/null); then
+        printf '%s\n' "$configuration_result"
+    else
+        printf '%s\n' "$configuration_default"
+    fi
 }
 
 validate_configuration() {
@@ -127,12 +135,21 @@ validate_configuration() {
     [ -e "$configuration_file" ] || return 0
     [ -f "$configuration_file" ] && [ ! -L "$configuration_file" ] || return 1
     meaningful_lines=$(grep -Evc '^[[:space:]]*(#.*)?$' "$configuration_file" || true)
-    [ "$meaningful_lines" -eq 4 ] || return 1
+    case "$meaningful_lines" in 4|6) ;; *) return 1 ;; esac
     [ "$(yaml_scalar schema_version "$configuration_file" 2>/dev/null || true)" = 1 ] || return 1
     for configuration_key in base_agent operator_agent wiki_agent; do
         configuration_setting=$(yaml_scalar "$configuration_key" "$configuration_file" 2>/dev/null || true)
         case "$configuration_setting" in enabled|disabled) ;; *) return 1 ;; esac
     done
+    if [ "$meaningful_lines" -eq 6 ]; then
+        secret_provider=$(yaml_scalar secret_provider "$configuration_file" 2>/dev/null || true)
+        secret_name=$(yaml_scalar secret_name "$configuration_file" 2>/dev/null || true)
+        case "$secret_provider" in
+            none) [ -z "$secret_name" ] || return 1 ;;
+            dotenv) printf '%s\n' "$secret_name" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]{0,127}$' || return 1 ;;
+            *) return 1 ;;
+        esac
+    fi
 }
 
 render_configuration() {
@@ -140,11 +157,15 @@ render_configuration() {
     base_setting=$2
     operator_setting=$3
     wiki_setting=$4
+    secret_provider_setting=${5:-none}
+    secret_name_setting=${6:-}
     cat >"$output_file" <<EOF
 schema_version: "1"
 base_agent: "$base_setting"
 operator_agent: "$operator_setting"
 wiki_agent: "$wiki_setting"
+secret_provider: "$secret_provider_setting"
+secret_name: "$secret_name_setting"
 EOF
 }
 
@@ -191,6 +212,518 @@ approve_destructive_purge() {
 
 find_repository_root() {
     git -C "$1" rev-parse --show-toplevel 2>/dev/null || return 1
+}
+
+dotenv_refuse() {
+    fail "dotenv refused: $1" "$readonly_exit_validation"
+}
+
+credential_refuse() {
+    fail "credential consumer refused: $1" "$readonly_exit_validation"
+}
+
+credential_consume_command() {
+    repository_path=.
+    credential_provider=''
+    requested_name=''
+    consumer_profile=''
+    operation_identity=''
+    authorization_profile=''
+    validation_profile=''
+    output_fd=''
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --repo) [ "$#" -ge 2 ] || fail '--repo requires a path'; repository_path=$2; shift 2 ;;
+            --provider) [ "$#" -ge 2 ] || fail '--provider requires a value'; credential_provider=$2; shift 2 ;;
+            --name) [ "$#" -ge 2 ] || fail '--name requires a value'; requested_name=$2; shift 2 ;;
+            --consumer) [ "$#" -ge 2 ] || fail '--consumer requires a value'; consumer_profile=$2; shift 2 ;;
+            --operation) [ "$#" -ge 2 ] || fail '--operation requires a value'; operation_identity=$2; shift 2 ;;
+            --authorization) [ "$#" -ge 2 ] || fail '--authorization requires a value'; authorization_profile=$2; shift 2 ;;
+            --validation) [ "$#" -ge 2 ] || fail '--validation requires a value'; validation_profile=$2; shift 2 ;;
+            --output-fd) [ "$#" -ge 2 ] || fail '--output-fd requires a value'; output_fd=$2; shift 2 ;;
+            *) fail "unknown internal credential-consumer argument: $1" ;;
+        esac
+    done
+    [ "${INTELLI_REPO_INTERNAL_CREDENTIAL_CONSUMER:-}" = 1 ] || credential_refuse consumer-invalid
+    [ "$credential_provider" = dotenv ] || credential_refuse provider-invalid
+    printf '%s\n' "$requested_name" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]{0,127}$' || credential_refuse name-missing
+    [ "$consumer_profile" = descriptor-v1 ] || credential_refuse consumer-invalid
+    printf '%s\n' "$operation_identity" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$' || credential_refuse consumer-invalid
+    [ "$authorization_profile" = read-only ] || credential_refuse authorization-invalid
+    [ "$validation_profile" = none ] || credential_refuse validation-failed
+    [ "$output_fd" = 3 ] || credential_refuse consumer-invalid
+    if ! (: >&3) 2>/dev/null; then credential_refuse consumer-invalid; fi
+
+    # The selected name is resolved only from the fixed provider file. The
+    # in-process descriptor consumer never consults or mutates an ambient copy.
+    INTELLI_REPO_INTERNAL_DOTENV_READER=1
+    export INTELLI_REPO_INTERNAL_DOTENV_READER
+    dotenv_read_command --repo "$repository_path" --name "$requested_name" --output-fd 3
+    unset INTELLI_REPO_INTERNAL_DOTENV_READER
+}
+
+dotenv_windows_read() {
+    windows_dotenv_path=$1
+    windows_requested_name=$2
+    if command -v pwsh >/dev/null 2>&1; then
+        windows_powershell=$(command -v pwsh)
+    elif command -v powershell.exe >/dev/null 2>&1; then
+        windows_powershell=$(command -v powershell.exe)
+    else
+        dotenv_refuse security-unverifiable
+    fi
+    command -v cygpath >/dev/null 2>&1 || dotenv_refuse security-unverifiable
+    windows_dotenv_path=$(cygpath -aw -- "$windows_dotenv_path" 2>/dev/null) || dotenv_refuse path-unsafe
+
+    if INTELLI_REPO_DOTENV_PATH=$windows_dotenv_path INTELLI_REPO_DOTENV_NAME=$windows_requested_name \
+        "$windows_powershell" -NoLogo -NoProfile -NonInteractive -Command - \
+        >&3 2>/dev/null <<'DOTENV_POWERSHELL'
+$ErrorActionPreference = 'Stop'
+
+function Stop-Dotenv([int] $Code) {
+    exit $Code
+}
+
+try {
+    $null = Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class IntelliRepoDotenvNative {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FILE_ATTRIBUTE_TAG_INFO {
+        public uint FileAttributes;
+        public uint ReparseTag;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BY_HANDLE_FILE_INFORMATION {
+        public uint FileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern SafeFileHandle CreateFileW(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetFileInformationByHandleEx(
+        SafeFileHandle file,
+        int informationClass,
+        out FILE_ATTRIBUTE_TAG_INFO information,
+        uint bufferSize);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetFileInformationByHandle(
+        SafeFileHandle file,
+        out BY_HANDLE_FILE_INFORMATION information);
+}
+'@
+} catch {
+    Stop-Dotenv 44
+}
+
+$path = [Environment]::GetEnvironmentVariable('INTELLI_REPO_DOTENV_PATH', 'Process')
+$requestedName = [Environment]::GetEnvironmentVariable('INTELLI_REPO_DOTENV_NAME', 'Process')
+if ([String]::IsNullOrEmpty($path) -or [String]::IsNullOrEmpty($requestedName)) {
+    Stop-Dotenv 52
+}
+
+$handle = $null
+$stream = $null
+try {
+    $genericRead = [uint32] 0x80000000
+    $shareRead = [uint32] 1
+    $openExisting = [uint32] 3
+    $openReparsePoint = [uint32] 0x00200000
+    $sequentialScan = [uint32] 0x08000000
+    $handle = [IntelliRepoDotenvNative]::CreateFileW(
+        $path,
+        $genericRead,
+        $shareRead,
+        [IntPtr]::Zero,
+        $openExisting,
+        ($openReparsePoint -bor $sequentialScan),
+        [IntPtr]::Zero)
+    if ($null -eq $handle -or $handle.IsInvalid) {
+        Stop-Dotenv 44
+    }
+
+    $attributeInfo = New-Object IntelliRepoDotenvNative+FILE_ATTRIBUTE_TAG_INFO
+    $attributeSize = [Runtime.InteropServices.Marshal]::SizeOf($attributeInfo)
+    if (-not [IntelliRepoDotenvNative]::GetFileInformationByHandleEx($handle, 9, [ref] $attributeInfo, $attributeSize)) {
+        Stop-Dotenv 44
+    }
+    $directoryAttribute = [uint32] 0x10
+    $deviceAttribute = [uint32] 0x40
+    $reparseAttribute = [uint32] 0x400
+    if (($attributeInfo.FileAttributes -band $reparseAttribute) -ne 0) {
+        Stop-Dotenv 40
+    }
+    if (($attributeInfo.FileAttributes -band ($directoryAttribute -bor $deviceAttribute)) -ne 0) {
+        Stop-Dotenv 41
+    }
+
+    $fileInfo = New-Object IntelliRepoDotenvNative+BY_HANDLE_FILE_INFORMATION
+    if (-not [IntelliRepoDotenvNative]::GetFileInformationByHandle($handle, [ref] $fileInfo)) {
+        Stop-Dotenv 44
+    }
+    if ($fileInfo.NumberOfLinks -ne 1) {
+        Stop-Dotenv 40
+    }
+    $fileLength = ([uint64] $fileInfo.FileSizeHigh * [uint64] 4294967296) + [uint64] $fileInfo.FileSizeLow
+    if ($fileLength -gt 65536) {
+        Stop-Dotenv 45
+    }
+
+    $stream = New-Object -TypeName System.IO.FileStream -ArgumentList @($handle, [System.IO.FileAccess]::Read, 4096, $false)
+    $handle = $null
+    try {
+        if ($stream.PSObject.Methods.Name -contains 'GetAccessControl') {
+            $security = $stream.GetAccessControl()
+        } else {
+            $security = [System.IO.FileSystemAclExtensions]::GetAccessControl($stream)
+        }
+    } catch {
+        Stop-Dotenv 44
+    }
+
+    try {
+        $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        $ownerSid = $security.GetOwner([System.Security.Principal.SecurityIdentifier])
+    } catch {
+        Stop-Dotenv 44
+    }
+    if ($null -eq $currentSid -or $null -eq $ownerSid -or $ownerSid.Value -ne $currentSid.Value) {
+        Stop-Dotenv 42
+    }
+    if (-not $security.AreAccessRulesCanonical) {
+        Stop-Dotenv 43
+    }
+    try {
+        $sddl = $security.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)
+        $rules = $security.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
+    } catch {
+        Stop-Dotenv 44
+    }
+    if ([String]::IsNullOrEmpty($sddl) -or -not $sddl.Contains('D:')) {
+        Stop-Dotenv 43
+    }
+
+    $allowedSids = @($currentSid.Value, 'S-1-5-18', 'S-1-5-32-544')
+    $currentUserCanRead = $false
+    foreach ($rule in $rules) {
+        $sid = $rule.IdentityReference
+        try {
+            $null = $sid.Translate([System.Security.Principal.NTAccount])
+        } catch {
+            Stop-Dotenv 43
+        }
+        if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow) {
+            if ($allowedSids -notcontains $sid.Value) {
+                Stop-Dotenv 43
+            }
+            if ($sid.Value -eq $currentSid.Value -and (($rule.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::ReadData) -ne 0)) {
+                $currentUserCanRead = $true
+            }
+        } elseif ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Deny) {
+            Stop-Dotenv 43
+        }
+        if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Deny -and
+            $sid.Value -eq $currentSid.Value -and
+            (($rule.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::ReadData) -ne 0)) {
+            Stop-Dotenv 43
+        }
+    }
+    if (-not $currentUserCanRead) {
+        Stop-Dotenv 43
+    }
+
+    $bytes = New-Object byte[] ([int] $fileLength)
+    $offset = 0
+    while ($offset -lt $bytes.Length) {
+        $count = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+        if ($count -eq 0) {
+            Stop-Dotenv 52
+        }
+        $offset += $count
+    }
+    if ($stream.ReadByte() -ne -1) {
+        Stop-Dotenv 45
+    }
+    $stream.Dispose()
+    $stream = $null
+
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        Stop-Dotenv 47
+    }
+    try {
+        $utf8 = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList @($false, $true)
+        $content = $utf8.GetString($bytes)
+    } catch {
+        Stop-Dotenv 46
+    }
+    if ($content.IndexOf([char] 0) -ge 0) {
+        Stop-Dotenv 47
+    }
+
+    $seen = New-Object -TypeName 'System.Collections.Generic.HashSet[string]' -ArgumentList @([System.StringComparer]::Ordinal)
+    $selected = $null
+    $found = $false
+    foreach ($rawLine in $content.Split([char] 10)) {
+        $line = $rawLine
+        if ($line.EndsWith("`r")) {
+            $line = $line.Substring(0, $line.Length - 1)
+        }
+        if ($line.IndexOf("`r") -ge 0 -or $utf8.GetByteCount($line) -gt 16384) {
+            Stop-Dotenv 47
+        }
+        if ($line -match '^[ \t]*$' -or $line -match '^[ \t]*#') {
+            continue
+        }
+        if ($line -notmatch '^[A-Za-z_][A-Za-z0-9_]*=') {
+            Stop-Dotenv 47
+        }
+        $separator = $line.IndexOf('=')
+        $name = $line.Substring(0, $separator)
+        if ($name.Length -gt 128) {
+            Stop-Dotenv 47
+        }
+        if (-not $seen.Add($name)) {
+            Stop-Dotenv 48
+        }
+        $value = $line.Substring($separator + 1)
+        if ($value.Contains('${') -or $value.Contains('$(') -or $value.Contains('`')) {
+            Stop-Dotenv 47
+        }
+        if ($name -ceq $requestedName) {
+            $selected = $value
+            $found = $true
+        }
+    }
+    if (-not $found) {
+        Stop-Dotenv 49
+    }
+    if ($selected.Length -eq 0) {
+        Stop-Dotenv 50
+    }
+    $selectedBytes = $utf8.GetBytes($selected)
+    if ($selectedBytes.Length -gt 8192) {
+        Stop-Dotenv 51
+    }
+    $output = [Console]::OpenStandardOutput()
+    $output.Write($selectedBytes, 0, $selectedBytes.Length)
+    $output.Flush()
+    exit 0
+} catch {
+    Stop-Dotenv 52
+} finally {
+    if ($null -ne $stream) {
+        $stream.Dispose()
+    } elseif ($null -ne $handle) {
+        $handle.Dispose()
+    }
+}
+DOTENV_POWERSHELL
+    then
+        return 0
+    else
+        windows_status=$?
+    fi
+
+    case "$windows_status" in
+        40) dotenv_refuse path-unsafe ;;
+        41) dotenv_refuse file-type-unsafe ;;
+        42) dotenv_refuse owner-invalid ;;
+        43) dotenv_refuse acl-invalid ;;
+        44) dotenv_refuse security-unverifiable ;;
+        45) dotenv_refuse file-too-large ;;
+        46) dotenv_refuse encoding-invalid ;;
+        47) dotenv_refuse grammar-invalid ;;
+        48) dotenv_refuse duplicate-name ;;
+        49) dotenv_refuse name-missing ;;
+        50) dotenv_refuse empty-value ;;
+        51) dotenv_refuse value-too-large ;;
+        *) dotenv_refuse internal-failure ;;
+    esac
+}
+
+dotenv_read_command() {
+    repository_path=.
+    requested_name=''
+    output_fd=''
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --repo) [ "$#" -ge 2 ] || fail '--repo requires a path'; repository_path=$2; shift 2 ;;
+            --name) [ "$#" -ge 2 ] || fail '--name requires a value'; requested_name=$2; shift 2 ;;
+            --output-fd) [ "$#" -ge 2 ] || fail '--output-fd requires a value'; output_fd=$2; shift 2 ;;
+            *) fail "unknown internal dotenv-reader argument: $1" ;;
+        esac
+    done
+    [ "${INTELLI_REPO_INTERNAL_DOTENV_READER:-}" = 1 ] || fail 'internal dotenv reader is not a public command'
+    [ "$output_fd" = 3 ] || fail 'internal dotenv reader requires dedicated descriptor 3'
+    if ! (: >&3) 2>/dev/null; then fail 'internal dotenv consumer descriptor is unavailable' "$readonly_exit_preflight"; fi
+    printf '%s\n' "$requested_name" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]{0,127}$' || dotenv_refuse name-missing
+
+    repository_root=$(find_repository_root "$repository_path") || dotenv_refuse repository-invalid
+    repository_root=$(CDPATH= cd -- "$repository_root" && pwd -P) || dotenv_refuse repository-invalid
+    dotenv_path=$repository_root/.intelli-repo/.env
+    [ -e "$dotenv_path" ] || dotenv_refuse file-missing
+    [ ! -L "$dotenv_path" ] || dotenv_refuse path-unsafe
+    [ -f "$dotenv_path" ] || dotenv_refuse file-type-unsafe
+    if git -C "$repository_root" ls-files --error-unmatch -- .intelli-repo/.env >/dev/null 2>&1; then
+        dotenv_refuse git-exposure
+    fi
+    git -C "$repository_root" check-ignore -q --no-index -- .intelli-repo/.env || dotenv_refuse git-exposure
+    for public_copy in "$repository_root/dist/intelli-repo/.intelli-repo/.env" "$repository_root/src/distribution/.intelli-repo/.env"; do
+        [ ! -e "$public_copy" ] && [ ! -L "$public_copy" ] || dotenv_refuse public-tree-exposure
+    done
+
+    platform_name=$(uname -s 2>/dev/null || true)
+    case "$platform_name" in
+        Linux)
+            require_command stat
+            require_command id
+            require_command iconv
+            before_record=$(stat -c '%F|%u|%a|%h|%s|%d|%i' -- "$dotenv_path" 2>/dev/null) || dotenv_refuse security-unverifiable
+            case "$before_record" in 'regular file|'*) ;; *) dotenv_refuse file-type-unsafe ;; esac
+            if ! exec 9<"$dotenv_path"; then dotenv_refuse file-missing; fi
+            fd_path=/proc/self/fd/9
+            [ -r "$fd_path" ] || dotenv_refuse security-unverifiable
+            after_record=$(stat -Lc '%F|%u|%a|%h|%s|%d|%i' -- "$fd_path" 2>/dev/null) || dotenv_refuse security-unverifiable
+            [ "$before_record" = "$after_record" ] || dotenv_refuse path-unsafe
+            ;;
+        Darwin)
+            require_command stat
+            require_command id
+            require_command iconv
+            before_record=$(stat -f '%HT|%u|%Lp|%l|%z|%d|%i' "$dotenv_path" 2>/dev/null) || dotenv_refuse security-unverifiable
+            case "$before_record" in 'Regular File|'*) ;; *) dotenv_refuse file-type-unsafe ;; esac
+            if ! exec 9<"$dotenv_path"; then dotenv_refuse file-missing; fi
+            fd_path=/dev/fd/9
+            [ -r "$fd_path" ] || dotenv_refuse security-unverifiable
+            after_record=$(stat -Lf '%HT|%u|%Lp|%l|%z|%d|%i' "$fd_path" 2>/dev/null) || dotenv_refuse security-unverifiable
+            [ "$before_record" = "$after_record" ] || dotenv_refuse path-unsafe
+            ;;
+        CYGWIN*|MINGW*|MSYS*|Windows_NT)
+            dotenv_windows_read "$dotenv_path" "$requested_name"
+            return 0
+            ;;
+        *)
+            dotenv_refuse security-unverifiable
+            ;;
+    esac
+
+    file_owner=$(printf '%s\n' "$after_record" | awk -F '|' '{ print $2 }')
+    file_mode=$(printf '%s\n' "$after_record" | awk -F '|' '{ print $3 }')
+    file_links=$(printf '%s\n' "$after_record" | awk -F '|' '{ print $4 }')
+    file_size=$(printf '%s\n' "$after_record" | awk -F '|' '{ print $5 }')
+    [ "$file_owner" = "$(id -u)" ] || dotenv_refuse owner-invalid
+    case "$file_mode" in 400|600) ;; *) dotenv_refuse permissions-invalid ;; esac
+    [ "$file_links" -eq 1 ] || dotenv_refuse path-unsafe
+    [ "$file_size" -le 65536 ] || dotenv_refuse file-too-large
+
+    require_command mkfifo
+    dotenv_stream_root=$(mktemp -d "${TMPDIR:-/tmp}/intelli-repo-dotenv-stream.XXXXXX") || dotenv_refuse internal-failure
+    chmod 0700 "$dotenv_stream_root" || dotenv_refuse internal-failure
+    dotenv_data_fifo=$dotenv_stream_root/data
+    dotenv_result_fifo=$dotenv_stream_root/result
+    dotenv_status_file=$dotenv_stream_root/status
+    mkfifo "$dotenv_data_fifo" "$dotenv_result_fifo" || dotenv_refuse internal-failure
+    dotenv_converter_pid=''
+    dotenv_parser_pid=''
+    dotenv_stream_cleanup() {
+        cleanup_result=$?
+        trap - EXIT HUP INT TERM
+        [ -z "$dotenv_converter_pid" ] || kill "$dotenv_converter_pid" >/dev/null 2>&1 || true
+        [ -z "$dotenv_parser_pid" ] || kill "$dotenv_parser_pid" >/dev/null 2>&1 || true
+        rm -f -- "$dotenv_data_fifo" "$dotenv_result_fifo" "$dotenv_status_file"
+        rmdir -- "$dotenv_stream_root" 2>/dev/null || true
+        exit "$cleanup_result"
+    }
+    trap dotenv_stream_cleanup EXIT HUP INT TERM
+
+    LC_ALL=C awk -v requested="$requested_name" -v status_file="$dotenv_status_file" -v result_fifo="$dotenv_result_fifo" '
+        BEGIN { selected = ""; found = 0; error = ""; bom = sprintf("%c%c%c", 239, 187, 191); nul = sprintf("%c", 0) }
+        {
+            line = $0
+            if (NR == 1 && substr(line, 1, 3) == bom) { error = "grammar-invalid"; exit }
+            if (substr(line, length(line), 1) == "\r") line = substr(line, 1, length(line) - 1)
+            if (index(line, "\r") || index(line, nul)) { error = "grammar-invalid"; exit }
+            if (length(line) > 16384) { error = "grammar-invalid"; exit }
+            if (line ~ /^[ \t]*$/ || line ~ /^[ \t]*#/) next
+            if (line !~ /^[A-Za-z_][A-Za-z0-9_]*=/) { error = "grammar-invalid"; exit }
+            separator = index(line, "=")
+            name = substr(line, 1, separator - 1)
+            if (length(name) > 128) { error = "grammar-invalid"; exit }
+            if (seen[name]++) { error = "duplicate-name"; exit }
+            value = substr(line, separator + 1)
+            if (value ~ /\$\{/ || value ~ /\$\(/ || value ~ /`/) { error = "grammar-invalid"; exit }
+            if (name == requested) { selected = value; found = 1 }
+        }
+        END {
+            if (!error && !found) error = "name-missing"
+            if (!error && length(selected) == 0) error = "empty-value"
+            if (!error && length(selected) > 8192) error = "value-too-large"
+            if (error) {
+                print error > status_file
+                close(status_file)
+                exit
+            }
+            print "selected" > status_file
+            close(status_file)
+            printf "%s", selected > result_fifo
+            close(result_fifo)
+        }
+    ' "$dotenv_data_fifo" >/dev/null 2>&1 &
+    dotenv_parser_pid=$!
+    iconv -f UTF-8 -t UTF-8 <&9 >"$dotenv_data_fifo" 2>/dev/null &
+    dotenv_converter_pid=$!
+    if ! wait "$dotenv_converter_pid"; then
+        dotenv_converter_pid=''
+        kill "$dotenv_parser_pid" >/dev/null 2>&1 || true
+        wait "$dotenv_parser_pid" 2>/dev/null || true
+        dotenv_parser_pid=''
+        dotenv_refuse encoding-invalid
+    fi
+    dotenv_converter_pid=''
+    exec 9<&-
+    while [ ! -s "$dotenv_status_file" ] && kill -0 "$dotenv_parser_pid" >/dev/null 2>&1; do :; done
+    [ -s "$dotenv_status_file" ] || dotenv_refuse internal-failure
+    IFS= read -r parser_status <"$dotenv_status_file" || dotenv_refuse internal-failure
+    case "$parser_status" in
+        selected)
+            cat "$dotenv_result_fifo" >&3
+            wait "$dotenv_parser_pid" || dotenv_refuse internal-failure
+            dotenv_parser_pid=''
+            ;;
+        grammar-invalid|duplicate-name|name-missing|empty-value|value-too-large)
+            wait "$dotenv_parser_pid" || true
+            dotenv_parser_pid=''
+            dotenv_refuse "$parser_status"
+            ;;
+        *) dotenv_refuse internal-failure ;;
+    esac
+    trap - EXIT HUP INT TERM
+    rm -f -- "$dotenv_data_fifo" "$dotenv_result_fifo" "$dotenv_status_file"
+    rmdir -- "$dotenv_stream_root" || dotenv_refuse internal-failure
 }
 
 canonical_requested_path() {
@@ -365,7 +898,166 @@ index_commit() {
     printf '%s\n' "$record" | awk '{ print $2 }'
 }
 
-validate_installation() {
+required_wiki_directories() {
+    cat <<'EOF'
+wiki
+wiki/inbox
+wiki/questions
+wiki/decisions
+wiki/findings
+wiki/proposals
+wiki/plans
+wiki/tasks
+wiki/logs
+wiki/ingest
+wiki/_archive
+wiki/capabilities
+wiki/capabilities/policies
+wiki/capabilities/skills
+wiki/capabilities/tests
+wiki/capabilities/tools
+EOF
+}
+
+validate_wiki_scaffold() {
+    scaffold_root=$1
+    required_wiki_directories | while IFS= read -r relative_path; do
+        [ ! -L "$scaffold_root/$relative_path" ] || exit 1
+        [ -d "$scaffold_root/$relative_path" ] || exit 1
+    done
+}
+
+yaml_path_list() {
+    path_list=$1
+    yaml_paths=''
+    for relative_path in $path_list; do
+        [ -z "$yaml_paths" ] || yaml_paths=$yaml_paths', '
+        yaml_paths=$yaml_paths\"$relative_path\"
+    done
+    printf '[%s]' "$yaml_paths"
+}
+
+validate_update_source_installation() {
+    source_root=$1
+    source_version=$2
+    source_command=$source_root/.intelli-repo/bin/intelli-repo
+    source_modules=$source_root/.gitmodules
+    [ -x "$source_command" ] || return 1
+    [ "$("$source_command" version 2>/dev/null || true)" = "$source_version" ] || return 1
+    case "$source_version" in
+        v0.1.0-beta.1)
+            expected_source_base=$readonly_supported_beta_1_base_agent_commit
+            expected_source_operator=$readonly_supported_beta_1_operator_agent_commit
+            expected_source_wiki=$readonly_supported_beta_1_wiki_agent_commit
+            ;;
+        "$readonly_distribution_version")
+            expected_source_base=$readonly_base_agent_commit
+            expected_source_operator=$readonly_operator_agent_commit
+            expected_source_wiki=$readonly_wiki_agent_commit
+            ;;
+        *) expected_source_base=''; expected_source_operator=''; expected_source_wiki='' ;;
+    esac
+    for component in base-agent operator-agent wiki-agent; do
+        case "$component" in
+            base-agent) source_variable=readonly_base_agent_commit; expected_source_commit=$expected_source_base ;;
+            operator-agent) source_variable=readonly_operator_agent_commit; expected_source_commit=$expected_source_operator ;;
+            wiki-agent) source_variable=readonly_wiki_agent_commit; expected_source_commit=$expected_source_wiki ;;
+        esac
+        source_commit=$(awk -F"'" -v variable="$source_variable" '$1 == variable "=" { print $2; exit }' "$source_command")
+        case "$source_commit" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;; *) return 1 ;; esac
+        component_path=.intelli-repo/$component
+        [ -z "$expected_source_commit" ] || [ "$source_commit" = "$expected_source_commit" ] || return 1
+        [ "$(index_commit "$source_root" "$component_path" 2>/dev/null || true)" = "$source_commit" ] || return 1
+        [ "$(git -C "$source_root/$component_path" rev-parse HEAD 2>/dev/null || true)" = "$source_commit" ] || return 1
+        [ -z "$(git -C "$source_root/$component_path" status --porcelain 2>/dev/null)" ] || return 1
+        module_key=$(submodule_entry_for_path "$source_modules" "$component_path") || return 1
+        [ -n "$(git config -f "$source_modules" --get "$module_key.url" 2>/dev/null || true)" ] || return 1
+        [ -z "$(git config -f "$source_modules" --get "$module_key.branch" 2>/dev/null || true)" ] || return 1
+    done
+    [ "$(grep -Fc '# BEGIN INTELLI-REPO MANAGED v1' "$source_root/Makefile" 2>/dev/null || true)" -eq 1 ] || return 1
+    [ "$(grep -Fc '# END INTELLI-REPO MANAGED v1' "$source_root/Makefile" 2>/dev/null || true)" -eq 1 ] || return 1
+}
+
+prepare_update_scaffold() {
+    scaffold_repository=$1
+    scaffold_payload=$2
+    : >"$scaffold_payload/wiki-scaffold.before"
+    : >"$scaffold_payload/created-wiki-directories"
+    : >"$scaffold_payload/created-wiki-markers"
+    : >"$scaffold_payload/planned-wiki-directories"
+    : >"$scaffold_payload/planned-wiki-markers"
+    required_wiki_directories | while IFS= read -r relative_path; do
+        target_path=$scaffold_repository/$relative_path
+        marker_path=$target_path/.gitkeep
+        [ ! -L "$target_path" ] || fail "symlinked required wiki path is prohibited: $relative_path" "$readonly_exit_preflight"
+        [ ! -e "$target_path" ] || [ -d "$target_path" ] || fail "required wiki path is not a directory: $relative_path" "$readonly_exit_preflight"
+        [ ! -L "$marker_path" ] || fail "symlinked wiki marker is prohibited: $relative_path/.gitkeep" "$readonly_exit_preflight"
+        [ ! -e "$marker_path" ] || [ -f "$marker_path" ] || fail "wiki marker path is not a regular file: $relative_path/.gitkeep" "$readonly_exit_preflight"
+        if [ -d "$target_path" ]; then before_directory=present; else before_directory=absent; fi
+        if [ -f "$marker_path" ]; then before_marker=present; else before_marker=absent; fi
+        printf '%s|%s|%s\n' "$relative_path" "$before_directory" "$before_marker" >>"$scaffold_payload/wiki-scaffold.before"
+        [ "$before_directory" = present ] || printf '%s\n' "$relative_path" >>"$scaffold_payload/planned-wiki-directories"
+        if [ "$before_marker" = absent ] && { [ "$before_directory" = absent ] || [ -z "$(find "$target_path" -mindepth 1 -maxdepth 1 -print -quit)" ]; }; then
+            printf '%s/.gitkeep\n' "$relative_path" >>"$scaffold_payload/planned-wiki-markers"
+        fi
+    done
+}
+
+backfill_update_scaffold() {
+    scaffold_repository=$1
+    scaffold_payload=$2
+    while IFS='|' read -r relative_path before_directory before_marker; do
+        target_path=$scaffold_repository/$relative_path
+        marker_path=$target_path/.gitkeep
+        if [ "$before_directory" = absent ]; then
+            mkdir -p "$target_path" || return 1
+            printf '%s\n' "$relative_path" >>"$scaffold_payload/created-wiki-directories"
+        fi
+        if [ "$before_marker" = absent ] && [ -z "$(find "$target_path" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+            : >"$marker_path" || return 1
+            printf '%s/.gitkeep\n' "$relative_path" >>"$scaffold_payload/created-wiki-markers"
+        fi
+    done <"$scaffold_payload/wiki-scaffold.before"
+}
+
+remove_created_update_scaffold() {
+    scaffold_repository=$1
+    scaffold_payload=$2
+    scaffold_report=$3
+    [ -f "$scaffold_payload/created-wiki-markers" ] || return 0
+    while IFS= read -r marker_relative || [ -n "$marker_relative" ]; do
+        [ -n "$marker_relative" ] || continue
+        marker_path=$scaffold_repository/$marker_relative
+        if [ -f "$marker_path" ] && [ ! -L "$marker_path" ] && [ ! -s "$marker_path" ]; then
+            rm -f -- "$marker_path"
+        elif [ -e "$marker_path" ]; then
+            printf 'preserved user-owned marker: %s\n' "$marker_relative" >>"$scaffold_report"
+        fi
+    done <"$scaffold_payload/created-wiki-markers"
+    if [ -f "$scaffold_payload/created-wiki-directories" ]; then
+        sort -r "$scaffold_payload/created-wiki-directories" | while IFS= read -r directory_relative || [ -n "$directory_relative" ]; do
+            [ -n "$directory_relative" ] || continue
+            directory_path=$scaffold_repository/$directory_relative
+            if [ -d "$directory_path" ] && [ ! -L "$directory_path" ]; then
+                rmdir "$directory_path" 2>/dev/null || printf 'preserved user-owned directory: %s\n' "$directory_relative" >>"$scaffold_report"
+            fi
+        done
+    fi
+}
+
+append_update_scaffold_receipt() {
+    receipt_file=$1
+    scaffold_payload=$2
+    created_directories=$(tr '\n' ' ' <"$scaffold_payload/created-wiki-directories")
+    created_markers=$(tr '\n' ' ' <"$scaffold_payload/created-wiki-markers")
+    cat >>"$receipt_file" <<EOF
+migration_schema: "generic-wiki-scaffold-v1"
+migration_created_directories: $(yaml_path_list "$created_directories")
+migration_created_markers: $(yaml_path_list "$created_markers")
+EOF
+}
+
+validate_installation_core() {
     repository_root=$1
     modules_file=$repository_root/.gitmodules
     [ -x "$repository_root/.intelli-repo/bin/intelli-repo" ] || return 1
@@ -395,6 +1087,11 @@ validate_installation() {
     grep -Fqx '	$(CURDIR)/.intelli-repo/bin/intelli-repo $(@:intelli-repo-%=%) --repo $(CURDIR)' "$repository_root/Makefile" || return 1
 }
 
+validate_installation() {
+    validate_installation_core "$1" || return 1
+    validate_wiki_scaffold "$1" || return 1
+}
+
 write_receipt() {
     receipt_file=$1
     receipt_result=$2
@@ -416,6 +1113,9 @@ components:
   operator_agent: "$readonly_operator_agent_commit"
   wiki_agent: "$readonly_wiki_agent_commit"
 git_index_changes_disclosed: true
+proposed_user_directories: ["wiki/inbox", "wiki/questions", "wiki/decisions", "wiki/findings", "wiki/proposals", "wiki/plans", "wiki/tasks", "wiki/logs", "wiki/ingest", "wiki/_archive", "wiki/capabilities/policies", "wiki/capabilities/skills", "wiki/capabilities/tests", "wiki/capabilities/tools", "workspace"]
+created_user_directories: $(yaml_path_list "$created_user_directories")
+created_wiki_markers: $(yaml_path_list "$created_wiki_markers")
 publication_performed: false
 EOF
 }
@@ -488,12 +1188,44 @@ doctor_command() {
         doctor_result fail integration.makefile 'managed region missing or ambiguous'
     fi
 
+    configuration_ready=0
     if [ ! -e "$repository_root/repo-agent-config.yaml" ]; then
         doctor_result not-applicable configuration 'absent; convention defaults apply'
     elif validate_configuration "$repository_root/repo-agent-config.yaml"; then
         doctor_result pass configuration 'schema version 1 is valid'
+        configuration_ready=1
     else
         doctor_result fail configuration 'invalid schema or unsupported value; run configure'
+    fi
+
+    if [ "$configuration_ready" -eq 1 ]; then
+        configured_secret_provider=$(configuration_value "$repository_root/repo-agent-config.yaml" secret_provider none)
+        configured_secret_name=$(configuration_value "$repository_root/repo-agent-config.yaml" secret_name '')
+    else
+        configured_secret_provider=none
+        configured_secret_name=''
+    fi
+    case "$configured_secret_provider" in
+        none) doctor_result not-applicable secret.dotenv 'provider not selected' ;;
+        dotenv)
+            if [ "$(uname -s 2>/dev/null || true)" != Linux ]; then
+                doctor_result fail secret.dotenv 'beta.2 dotenv support is available only on the verified Linux capability profile'
+            elif dotenv_check=$(
+                (INTELLI_REPO_INTERNAL_DOTENV_READER=1; export INTELLI_REPO_INTERNAL_DOTENV_READER; dotenv_read_command --repo "$repository_root" --name "$configured_secret_name" --output-fd 3 3>/dev/null) 2>&1
+            ); then
+                doctor_result pass secret.dotenv 'selected name is ready for bounded Linux delivery'
+            else
+                dotenv_check=${dotenv_check#intelli-repo: }
+                doctor_result fail secret.dotenv "${dotenv_check:-readiness could not be verified}"
+            fi
+            ;;
+        *) doctor_result fail secret.dotenv 'provider selection is invalid' ;;
+    esac
+
+    if validate_wiki_scaffold "$repository_root"; then
+        doctor_result pass wiki.scaffold 'complete generic user-owned scaffold'
+    else
+        doctor_result fail wiki.scaffold 'missing, symlinked, or wrong-type required directory'
     fi
 
     stale_operation=$(find "$repository_root/.intelli-repo/operations" -maxdepth 1 -type f -name '*.pending' -print -quit 2>/dev/null || true)
@@ -535,13 +1267,17 @@ configure_command() {
     approved=0
     approval_kind=tty
     set_specs=''
+    requested_secret_provider=''
+    requested_secret_name=''
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --repo) [ "$#" -ge 2 ] || fail '--repo requires a value'; requested_repository=$2; shift 2 ;;
             --set-agent) [ "$#" -ge 2 ] || fail '--set-agent requires NAME=STATE'; set_specs="$set_specs $2"; shift 2 ;;
+            --set-secret-provider) [ "$#" -ge 2 ] || fail '--set-secret-provider requires none or dotenv'; requested_secret_provider=$2; shift 2 ;;
+            --set-secret-name) [ "$#" -ge 2 ] || fail '--set-secret-name requires a name'; requested_secret_name=$2; shift 2 ;;
             --dry-run) dry_run=1; shift ;;
             --yes) approved=1; approval_kind=explicit-yes; shift ;;
-            --help|-h) printf '%s\n' 'Usage: intelli-repo configure [--repo PATH] [--set-agent NAME=enabled|disabled]... [--dry-run] [--yes]'; return ;;
+            --help|-h) printf '%s\n' 'Usage: intelli-repo configure [--repo PATH] [--set-agent NAME=enabled|disabled]... [--set-secret-provider none|dotenv] [--set-secret-name NAME] [--dry-run] [--yes]'; return ;;
             *) fail "unknown configure argument: $1" ;;
         esac
     done
@@ -552,14 +1288,17 @@ configure_command() {
     base_setting=$(configuration_value "$target_configuration_file" base_agent enabled)
     operator_setting=$(configuration_value "$target_configuration_file" operator_agent enabled)
     wiki_setting=$(configuration_value "$target_configuration_file" wiki_agent enabled)
+    secret_provider_setting=$(configuration_value "$target_configuration_file" secret_provider none)
+    secret_name_setting=$(configuration_value "$target_configuration_file" secret_name '')
 
     printf '%s\n' 'Intelli-Repo convention defaults'
     printf '%s\n' '  configuration file: optional repo-agent-config.yaml'
     printf '%s\n' '  default agents: base-agent=enabled operator-agent=enabled wiki-agent=enabled'
+    printf '%s\n' '  default secret provider: none; dotenv must be selected explicitly'
     printf '%s\n' '  control-plane changes: always displayed and explicitly approved'
-    if [ -z "$set_specs" ]; then
+    if [ -z "$set_specs" ] && [ -z "$requested_secret_provider" ] && [ -z "$requested_secret_name" ]; then
         if [ -e "$target_configuration_file" ]; then
-            printf '  current overrides: base-agent=%s operator-agent=%s wiki-agent=%s\n' "$base_setting" "$operator_setting" "$wiki_setting"
+            printf '  current overrides: base-agent=%s operator-agent=%s wiki-agent=%s secret-provider=%s\n' "$base_setting" "$operator_setting" "$wiki_setting" "$secret_provider_setting"
         else
             printf '%s\n' '  current overrides: absent; defaults apply'
         fi
@@ -579,6 +1318,20 @@ configure_command() {
         esac
     done
 
+    if [ -n "$requested_secret_provider" ]; then
+        case "$requested_secret_provider" in none|dotenv) secret_provider_setting=$requested_secret_provider ;; *) fail "invalid secret provider: $requested_secret_provider" ;; esac
+    fi
+    if [ -n "$requested_secret_name" ]; then
+        printf '%s\n' "$requested_secret_name" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]{0,127}$' || fail 'invalid secret name'
+        secret_name_setting=$requested_secret_name
+    fi
+    if [ "$secret_provider_setting" = none ]; then
+        [ -z "$requested_secret_name" ] || fail 'a secret name requires the explicitly selected dotenv provider'
+        secret_name_setting=''
+    else
+        [ -n "$secret_name_setting" ] || fail 'the dotenv provider requires --set-secret-name NAME'
+    fi
+
     operation_id=$(date -u '+%Y%m%dT%H%M%SZ')-configure-$$
     operations_root=$repository_root/.intelli-repo/operations
     transaction_root=$(mktemp -d "${TMPDIR:-/tmp}/intelli-repo-configure.XXXXXX") || fail 'could not create configuration transaction' "$readonly_exit_preflight"
@@ -586,9 +1339,22 @@ configure_command() {
         case ${transaction_root##*/} in intelli-repo-configure.??????) rm -rf -- "$transaction_root" ;; esac
     }
     trap cleanup_configure EXIT HUP INT TERM
-    render_configuration "$transaction_root/config.after" "$base_setting" "$operator_setting" "$wiki_setting"
+    render_configuration "$transaction_root/config.after" "$base_setting" "$operator_setting" "$wiki_setting" "$secret_provider_setting" "$secret_name_setting"
     validate_configuration "$transaction_root/config.after" || fail 'rendered configuration is invalid' "$readonly_exit_validation"
-    if [ -f "$target_configuration_file" ] && cmp -s "$target_configuration_file" "$transaction_root/config.after"; then
+    gitignore_file=$repository_root/.gitignore
+    gitignore_change=false
+    if [ "$secret_provider_setting" = dotenv ] && ! grep -Fqx '.intelli-repo/.env' "$gitignore_file" 2>/dev/null; then
+        [ ! -e "$gitignore_file" ] || { [ -f "$gitignore_file" ] && [ ! -L "$gitignore_file" ]; } || fail '.gitignore must be a regular nonsymlink file' "$readonly_exit_preflight"
+        if [ -f "$gitignore_file" ]; then
+            cp -p "$gitignore_file" "$transaction_root/gitignore.after" || fail 'could not stage .gitignore protection' "$readonly_exit_preflight"
+            [ ! -s "$transaction_root/gitignore.after" ] || printf '\n' >>"$transaction_root/gitignore.after"
+        else
+            : >"$transaction_root/gitignore.after"
+        fi
+        printf '%s\n' '.intelli-repo/.env' >>"$transaction_root/gitignore.after"
+        gitignore_change=true
+    fi
+    if [ -f "$target_configuration_file" ] && cmp -s "$target_configuration_file" "$transaction_root/config.after" && [ "$gitignore_change" = false ]; then
         printf '%s\n' 'Configuration already matches the requested state.'
         return
     fi
@@ -597,6 +1363,9 @@ configure_command() {
     printf '  base-agent: %s\n' "$base_setting"
     printf '  operator-agent: %s\n' "$operator_setting"
     printf '  wiki-agent: %s\n' "$wiki_setting"
+    printf '  secret-provider: %s\n' "$secret_provider_setting"
+    if [ "$secret_provider_setting" = dotenv ]; then printf '  secret-name: %s\n' "$secret_name_setting"; fi
+    if [ "$gitignore_change" = true ]; then printf '%s\n' '  .gitignore: add exact .intelli-repo/.env protection while preserving existing bytes'; fi
     printf '%s\n' '  excluded: staging, commit, push, publication, substrate mutation, and unrelated files'
     [ "$dry_run" -eq 0 ] || return 0
     approve_proposal "$approved" 'Apply this configuration proposal? Type yes: '
@@ -611,11 +1380,24 @@ configure_command() {
         config_existed=false
         : >"$rollback_root/configuration-was-absent"
     fi
+    if [ "$gitignore_change" = true ]; then
+        if [ -f "$gitignore_file" ]; then
+            cp -p "$gitignore_file" "$rollback_root/gitignore.before" || fail 'could not preserve .gitignore pre-state' "$readonly_exit_mutation"
+        else
+            : >"$rollback_root/gitignore-was-absent"
+        fi
+        staged_gitignore=$operations_root/$operation_id.gitignore.pending
+        cp -p "$transaction_root/gitignore.after" "$staged_gitignore" || fail 'could not stage .gitignore protection' "$readonly_exit_mutation"
+        mv "$staged_gitignore" "$gitignore_file" || fail 'could not apply .gitignore protection atomically' "$readonly_exit_mutation"
+    fi
     staged_configuration=$operations_root/$operation_id.config.pending
     cp -p "$transaction_root/config.after" "$staged_configuration" || fail 'could not stage configuration' "$readonly_exit_mutation"
     mv "$staged_configuration" "$target_configuration_file" || fail 'could not apply configuration atomically' "$readonly_exit_mutation"
     if ! validate_configuration "$target_configuration_file"; then
         if [ "$config_existed" = true ]; then cp -p "$rollback_root/repo-agent-config.yaml.before" "$target_configuration_file"; else rm -f -- "$target_configuration_file"; fi
+        if [ "$gitignore_change" = true ]; then
+            if [ -f "$rollback_root/gitignore.before" ]; then cp -p "$rollback_root/gitignore.before" "$gitignore_file"; else rm -f -- "$gitignore_file"; fi
+        fi
         fail 'configuration validation failed; pre-state restored' "$readonly_exit_validation"
     fi
     receipt_file=$operations_root/$operation_id.yaml
@@ -628,11 +1410,16 @@ approval: "$approval_kind"
 result: "success"
 configuration_existed_before: "$config_existed"
 configuration_after_sha256: "$(digest_file "$target_configuration_file")"
+gitignore_changed: "$gitignore_change"
+gitignore_after_sha256: "$([ -f "$gitignore_file" ] && digest_file "$gitignore_file" || printf absent)"
 rollback_payload: "$operation_id.rollback"
 publication_performed: false
 EOF
     }; then
         if [ "$config_existed" = true ]; then cp -p "$rollback_root/repo-agent-config.yaml.before" "$target_configuration_file"; else rm -f -- "$target_configuration_file"; fi
+        if [ "$gitignore_change" = true ]; then
+            if [ -f "$rollback_root/gitignore.before" ]; then cp -p "$rollback_root/gitignore.before" "$gitignore_file"; else rm -f -- "$gitignore_file"; fi
+        fi
         fail 'could not record configuration evidence; pre-state restored' "$readonly_exit_validation"
     fi
     printf 'Configuration updated successfully. Operation: %s.yaml\n' "$operation_id"
@@ -756,7 +1543,7 @@ apply_update_command() {
     resolve_installed_repository "$requested_repository"
     current_command=$repository_root/.intelli-repo/bin/intelli-repo
     [ "$("$current_command" version 2>/dev/null || true)" = "$from_version" ] || fail 'installed version changed during update acquisition' "$readonly_exit_compatibility"
-    "$current_command" doctor --repo "$repository_root" >/dev/null || fail 'installed state is unhealthy; run doctor before update' "$readonly_exit_validation"
+    validate_update_source_installation "$repository_root" "$from_version" || fail 'installed source command, pins, or managed region is unhealthy; run doctor before update' "$readonly_exit_validation"
     validate_configuration "$repository_root/repo-agent-config.yaml" || fail 'configuration is incompatible with update' "$readonly_exit_compatibility"
 
     before_base=$(index_commit "$repository_root" .intelli-repo/base-agent) || fail 'missing current base-agent pin' "$readonly_exit_validation"
@@ -770,6 +1557,7 @@ apply_update_command() {
     [ ! -e "$rollback_root" ] && [ ! -e "$receipt_file" ] || fail 'update operation identifier collision' "$readonly_exit_preflight"
     transaction_root=$(mktemp -d "${TMPDIR:-/tmp}/intelli-repo-update.XXXXXX") || fail 'could not create update transaction' "$readonly_exit_preflight"
     mkdir -p "$transaction_root/stage"
+    prepare_update_scaffold "$repository_root" "$transaction_root"
     managed_make_region >"$transaction_root/make.region"
     render_makefile "$repository_root/Makefile" "$transaction_root/Makefile.after" "$transaction_root/make.region"
     cp -p "$repository_root/.gitmodules" "$transaction_root/gitmodules.working.after"
@@ -799,7 +1587,9 @@ apply_update_command() {
     printf '  operator-agent: %s -> %s\n' "$before_operator" "$readonly_operator_agent_commit"
     printf '  wiki-agent: %s -> %s\n' "$before_wiki" "$readonly_wiki_agent_commit"
     printf '  rollback operation: %s.yaml\n' "$operation_id"
-    printf '%s\n' '  migrations: none required by this compatibility transition'
+    printf '%s\n' '  migration: generic wiki scaffold repair (missing paths only)'
+    printf '  create directories: %s\n' "$(tr '\n' ' ' <"$transaction_root/planned-wiki-directories")"
+    printf '  create markers: %s\n' "$(tr '\n' ' ' <"$transaction_root/planned-wiki-markers")"
     printf '%s\n' '  excluded: unrelated files/staging, commit, push, tag, publication, and PATH changes'
     if [ "$dry_run" -eq 1 ]; then
         case ${transaction_root##*/} in intelli-repo-update.??????) rm -rf -- "$transaction_root" ;; esac
@@ -817,6 +1607,9 @@ apply_update_command() {
     else
         : >"$rollback_root/configuration-was-absent"
     fi
+    cp -p "$transaction_root/wiki-scaffold.before" "$rollback_root/wiki-scaffold.before"
+    : >"$rollback_root/created-wiki-directories"
+    : >"$rollback_root/created-wiki-markers"
     transaction_active=1
 
     rollback_failed_update() {
@@ -834,7 +1627,9 @@ apply_update_command() {
         git -C "$repository_root" update-index --add --cacheinfo "160000,$before_operator,.intelli-repo/operator-agent" || rollback_ok=0
         git -C "$repository_root" update-index --add --cacheinfo "160000,$before_wiki,.intelli-repo/wiki-agent" || rollback_ok=0
         if [ -f "$rollback_root/repo-agent-config.yaml.before" ]; then cp -p "$rollback_root/repo-agent-config.yaml.before" "$repository_root/repo-agent-config.yaml" || rollback_ok=0; else rm -f -- "$repository_root/repo-agent-config.yaml"; fi
-        "$current_command" doctor --repo "$repository_root" >/dev/null 2>&1 || rollback_ok=0
+        : >"$rollback_root/scaffold-preserved-on-recovery"
+        remove_created_update_scaffold "$repository_root" "$rollback_root" "$rollback_root/scaffold-preserved-on-recovery" || rollback_ok=0
+        validate_update_source_installation "$repository_root" "$from_version" || rollback_ok=0
         [ "$rollback_ok" -eq 1 ]
     }
     cleanup_update() {
@@ -864,6 +1659,7 @@ apply_update_command() {
     git -C "$repository_root" update-index --add --cacheinfo "160000,$readonly_base_agent_commit,.intelli-repo/base-agent"
     git -C "$repository_root" update-index --add --cacheinfo "160000,$readonly_operator_agent_commit,.intelli-repo/operator-agent"
     git -C "$repository_root" update-index --add --cacheinfo "160000,$readonly_wiki_agent_commit,.intelli-repo/wiki-agent"
+    backfill_update_scaffold "$repository_root" "$rollback_root" || fail 'could not create missing generic wiki scaffold paths' "$readonly_exit_mutation"
     "$current_command" doctor --repo "$repository_root" >/dev/null || fail 'updated installation validation failed' "$readonly_exit_validation"
 
     command_after=$(digest_file "$current_command")
@@ -872,6 +1668,7 @@ apply_update_command() {
     modules_index_after=$(git -C "$repository_root" rev-parse :.gitmodules)
     if [ -f "$repository_root/repo-agent-config.yaml" ]; then config_after=$(digest_file "$repository_root/repo-agent-config.yaml"); else config_after=absent; fi
     write_update_receipt "$receipt_file" update success "$approval_kind" "$from_version" "$readonly_distribution_version" "$rollback_name" "$command_after" "$make_after" "$modules_after" "$modules_index_after" "$config_after" "$before_base" "$before_operator" "$before_wiki" "$readonly_base_agent_commit" "$readonly_operator_agent_commit" "$readonly_wiki_agent_commit" || fail 'could not record update evidence' "$readonly_exit_validation"
+    append_update_scaffold_receipt "$receipt_file" "$rollback_root" || fail 'could not record scaffold migration evidence' "$readonly_exit_validation"
     transaction_active=0
     trap - EXIT HUP INT TERM
     case ${transaction_root##*/} in intelli-repo-update.??????) rm -rf -- "$transaction_root" ;; esac
@@ -898,7 +1695,7 @@ rollback_update_command() {
     rollback_root=$operations_root/$rollback_name
     [ -d "$rollback_root" ] && [ ! -L "$rollback_root" ] || fail 'rollback payload is missing' "$readonly_exit_preflight"
     [ ! -e "$rollback_root/consumed-by" ] || fail 'rollback payload was already consumed' "$readonly_exit_compatibility"
-    for rollback_asset in intelli-repo.before Makefile.before gitmodules.working.before gitmodules.index.before base-agent.before operator-agent.before wiki-agent.before; do
+    for rollback_asset in intelli-repo.before Makefile.before gitmodules.working.before gitmodules.index.before base-agent.before operator-agent.before wiki-agent.before wiki-scaffold.before created-wiki-directories created-wiki-markers; do
         [ -e "$rollback_root/$rollback_asset" ] && [ ! -L "$rollback_root/$rollback_asset" ] || fail "rollback payload is incomplete or symlinked: $rollback_asset" "$readonly_exit_preflight"
     done
     if [ -e "$rollback_root/repo-agent-config.yaml.before" ]; then
@@ -958,6 +1755,7 @@ rollback_update_command() {
     cp -p "$repository_root/Makefile" "$recovery_root/Makefile.before"
     cp -p "$repository_root/.gitmodules" "$recovery_root/gitmodules.working.before"
     git -C "$repository_root" ls-files --stage -- .gitmodules >"$recovery_root/gitmodules.index.before"
+    : >"$recovery_root/scaffold-preserved-on-recovery"
     if [ -f "$repository_root/repo-agent-config.yaml" ]; then cp -p "$repository_root/repo-agent-config.yaml" "$recovery_root/repo-agent-config.yaml.before"; else : >"$recovery_root/configuration-was-absent"; fi
     rollback_active=1
     restore_current_after_failed_rollback() {
@@ -975,6 +1773,7 @@ rollback_update_command() {
         git -C "$repository_root" update-index --add --cacheinfo "160000,$after_operator,.intelli-repo/operator-agent" || restore_ok=0
         git -C "$repository_root" update-index --add --cacheinfo "160000,$after_wiki,.intelli-repo/wiki-agent" || restore_ok=0
         if [ -f "$recovery_root/repo-agent-config.yaml.before" ]; then cp -p "$recovery_root/repo-agent-config.yaml.before" "$repository_root/repo-agent-config.yaml" || restore_ok=0; else rm -f -- "$repository_root/repo-agent-config.yaml"; fi
+        backfill_update_scaffold "$repository_root" "$rollback_root" || restore_ok=0
         "$current_command" doctor --repo "$repository_root" >/dev/null 2>&1 || restore_ok=0
         [ "$restore_ok" -eq 1 ]
     }
@@ -1010,7 +1809,9 @@ rollback_update_command() {
         [ -f "$rollback_root/configuration-was-absent" ] && [ ! -L "$rollback_root/configuration-was-absent" ] || fail 'rollback configuration absence marker is missing' "$readonly_exit_preflight"
         rm -f -- "$repository_root/repo-agent-config.yaml"
     fi
-    "$current_command" doctor --repo "$repository_root" >/dev/null || fail 'restored installation validation failed' "$readonly_exit_validation"
+    : >"$recovery_root/scaffold-preserved-on-rollback"
+    remove_created_update_scaffold "$repository_root" "$rollback_root" "$recovery_root/scaffold-preserved-on-rollback" || fail 'could not restore generic wiki scaffold state' "$readonly_exit_mutation"
+    validate_update_source_installation "$repository_root" "$before_version" || fail 'restored installation validation failed' "$readonly_exit_validation"
 
     restored_command=$(digest_file "$current_command")
     restored_make=$(digest_file "$repository_root/Makefile")
@@ -1018,9 +1819,13 @@ rollback_update_command() {
     restored_modules_index=$(git -C "$repository_root" rev-parse :.gitmodules)
     if [ -f "$repository_root/repo-agent-config.yaml" ]; then restored_config=$(digest_file "$repository_root/repo-agent-config.yaml"); else restored_config=absent; fi
     write_update_receipt "$recovery_receipt" update-rollback success "$approval_kind" "$after_version" "$before_version" "$recovery_name" "$restored_command" "$restored_make" "$restored_modules" "$restored_modules_index" "$restored_config" "$after_base" "$after_operator" "$after_wiki" "$before_base" "$before_operator" "$before_wiki" || fail 'could not record rollback evidence' "$readonly_exit_validation"
+    append_update_scaffold_receipt "$recovery_receipt" "$rollback_root" || fail 'could not record rollback scaffold evidence' "$readonly_exit_validation"
     printf '%s\n' "${recovery_receipt##*/}" >"$rollback_root/consumed-by"
     rollback_active=0
     trap - EXIT HUP INT TERM
+    if [ -s "$recovery_root/scaffold-preserved-on-rollback" ]; then
+        sed 's/^/Intelli-Repo rollback: /' "$recovery_root/scaffold-preserved-on-rollback"
+    fi
     printf 'Intelli-Repo rollback completed successfully. Operation: %s\n' "${recovery_receipt##*/}"
 }
 
@@ -1072,8 +1877,10 @@ update_command() {
     INTELLI_REPO_BOOTSTRAP_CHECKSUMS=$acquisition_root/SHA256SUMS \
     INTELLI_REPO_BOOTSTRAP_SELECTION=explicit-update \
         "$acquisition_root/intelli-repo" "$@"
+    update_result=$?
     trap - EXIT HUP INT TERM
     cleanup_acquisition
+    exit "$update_result"
 }
 
 uninstall_command() {
@@ -1101,7 +1908,15 @@ uninstall_command() {
     resolve_installed_repository "$requested_repository"
     [ -z "$(find "$repository_root" -mindepth 1 -maxdepth 1 -name '.intelli-repo-uninstall-*.pending' -print -quit 2>/dev/null || true)" ] || fail 'an interrupted uninstall recovery bundle already exists; restore or remove it explicitly before retrying' "$readonly_exit_preflight"
     validate_installation "$repository_root" || fail 'owned installation is altered or unhealthy; refusing conservative uninstall' "$readonly_exit_validation"
-    unexpected_substrate=$(find "$repository_root/.intelli-repo" -mindepth 1 -maxdepth 1 ! -name bin ! -name operations ! -name base-agent ! -name operator-agent ! -name wiki-agent -print -quit 2>/dev/null || true)
+    dotenv_path=$repository_root/.intelli-repo/.env
+    dotenv_present=false
+    dotenv_digest=absent
+    if [ -e "$dotenv_path" ] || [ -L "$dotenv_path" ]; then
+        [ -f "$dotenv_path" ] && [ ! -L "$dotenv_path" ] || fail 'user-owned dotenv path is not a regular nonsymlink file' "$readonly_exit_preflight"
+        dotenv_present=true
+        dotenv_digest=$(digest_file "$dotenv_path")
+    fi
+    unexpected_substrate=$(find "$repository_root/.intelli-repo" -mindepth 1 -maxdepth 1 ! -name bin ! -name operations ! -name base-agent ! -name operator-agent ! -name wiki-agent ! -name .env -print -quit 2>/dev/null || true)
     [ -z "$unexpected_substrate" ] || fail "unowned content exists inside the substrate boundary: ${unexpected_substrate##*/}" "$readonly_exit_compatibility"
     unexpected_bin=$(find "$repository_root/.intelli-repo/bin" -mindepth 1 -maxdepth 1 ! -name intelli-repo -print -quit 2>/dev/null || true)
     [ -z "$unexpected_bin" ] || fail "unrecognized installed utility: ${unexpected_bin##*/}" "$readonly_exit_compatibility"
@@ -1163,12 +1978,13 @@ uninstall_command() {
     printf '%s\n' '  remove exact managed region: Makefile'
     printf '%s\n' '  preserve: repository history, unrelated files, unrelated staging, unrelated submodules, and bytes outside managed markers'
     if [ "$purge_user_data" -eq 0 ]; then
-        printf '%s\n' '  preserve unchanged: repo-agent-config.yaml, wiki/, and workspace/'
+        printf '%s\n' '  preserve unchanged: repo-agent-config.yaml, .intelli-repo/.env when present, wiki/, and workspace/'
     else
         printf '%s\n' '  destructive purge targets:'
         [ ! -e "$repository_root/repo-agent-config.yaml" ] || printf '%s\n' '    repo-agent-config.yaml'
         [ ! -e "$repository_root/wiki" ] || printf '%s\n' '    wiki/'
         [ ! -e "$repository_root/workspace" ] || printf '%s\n' '    workspace/'
+        [ "$dotenv_present" = false ] || printf '%s\n' '    .intelli-repo/.env'
         printf '%s\n' '  recovery: available during mutation; deleted user data is not recoverable from Intelli-Repo after success'
     fi
     if [ "$dry_run" -eq 1 ]; then
@@ -1184,11 +2000,22 @@ uninstall_command() {
     trap - EXIT HUP INT TERM
     transaction_active=1
     substrate_moved=0
+    dotenv_staged=0
+    dotenv_preserved=0
     rollback_uninstall() {
         rollback_ok=1
         if [ "$substrate_moved" -eq 1 ]; then
+            if [ "$dotenv_preserved" -eq 1 ] && [ -f "$repository_root/.intelli-repo/.env" ]; then
+                mv "$repository_root/.intelli-repo/.env" "$transaction_root/dotenv.rollback" || rollback_ok=0
+                rmdir "$repository_root/.intelli-repo" || rollback_ok=0
+            fi
             [ ! -e "$repository_root/.intelli-repo" ] || rollback_ok=0
             [ ! -d "$transaction_root/substrate" ] || mv "$transaction_root/substrate" "$repository_root/.intelli-repo" || rollback_ok=0
+            if [ -f "$transaction_root/dotenv.rollback" ]; then
+                mv "$transaction_root/dotenv.rollback" "$repository_root/.intelli-repo/.env" || rollback_ok=0
+            fi
+        elif [ "$dotenv_staged" -eq 1 ] && [ -f "$transaction_root/dotenv.preserved" ]; then
+            mv "$transaction_root/dotenv.preserved" "$repository_root/.intelli-repo/.env" || rollback_ok=0
         fi
         for purge_path in repo-agent-config.yaml wiki workspace; do
             if [ -e "$transaction_root/purge/$purge_path" ]; then
@@ -1250,10 +2077,26 @@ uninstall_command() {
             [ ! -e "$repository_root/$purge_path" ] || mv "$repository_root/$purge_path" "$transaction_root/purge/$purge_path" || fail "could not stage purge target: $purge_path" "$readonly_exit_mutation"
         done
     fi
+    if [ "$purge_user_data" -eq 0 ] && [ "$dotenv_present" = true ]; then
+        mv "$dotenv_path" "$transaction_root/dotenv.preserved" || fail 'could not stage user-owned dotenv preservation' "$readonly_exit_mutation"
+        dotenv_staged=1
+    fi
     mv "$repository_root/.intelli-repo" "$transaction_root/substrate" || fail 'could not stage installed substrate removal' "$readonly_exit_mutation"
     substrate_moved=1
 
-    [ ! -e "$repository_root/.intelli-repo" ] || fail 'installed substrate remains after uninstall' "$readonly_exit_validation"
+    if [ "$purge_user_data" -eq 0 ] && [ "$dotenv_present" = true ]; then
+        mkdir "$repository_root/.intelli-repo" || fail 'could not recreate user-owned dotenv container' "$readonly_exit_mutation"
+        chmod 0700 "$repository_root/.intelli-repo" || fail 'could not protect user-owned dotenv container' "$readonly_exit_mutation"
+        mv "$transaction_root/dotenv.preserved" "$dotenv_path" || fail 'could not restore user-owned dotenv file' "$readonly_exit_mutation"
+        dotenv_preserved=1
+        [ "$(digest_file "$dotenv_path")" = "$dotenv_digest" ] || fail 'user-owned dotenv file changed during uninstall' "$readonly_exit_validation"
+    fi
+
+    if [ "$dotenv_present" = true ] && [ "$purge_user_data" -eq 0 ]; then
+        [ "$(find "$repository_root/.intelli-repo" -mindepth 1 -maxdepth 1 ! -name .env -print -quit 2>/dev/null || true)" = '' ] || fail 'installed substrate remains beside preserved dotenv file' "$readonly_exit_validation"
+    else
+        [ ! -e "$repository_root/.intelli-repo" ] || fail 'installed substrate remains after uninstall' "$readonly_exit_validation"
+    fi
     [ -z "$(git -C "$repository_root" ls-files --stage -- .intelli-repo/base-agent .intelli-repo/operator-agent .intelli-repo/wiki-agent)" ] || fail 'owned gitlinks remain after uninstall' "$readonly_exit_validation"
     [ "$(grep -Fc '# BEGIN INTELLI-REPO MANAGED v1' "$repository_root/Makefile" 2>/dev/null || true)" -eq 0 ] || fail 'managed Makefile region remains after uninstall' "$readonly_exit_validation"
     for component in base-agent operator-agent wiki-agent; do
@@ -1268,7 +2111,7 @@ uninstall_command() {
     case "$transaction_root" in "$repository_root"/.intelli-repo-uninstall-*.pending) rm -rf -- "$transaction_root" ;; *) fail 'unsafe uninstall recovery cleanup path' "$readonly_exit_rollback" ;; esac
     printf 'Intelli-Repo uninstalled successfully. Operation: %s\n' "$operation_id"
     if [ "$purge_user_data" -eq 0 ]; then
-        printf '%s\n' 'User configuration and data were preserved unchanged.'
+        printf '%s\n' 'User configuration, dotenv file when present, and data were preserved unchanged.'
     else
         printf '%s\n' 'Purged repo-agent-config.yaml, wiki/, and workspace/ where present; Intelli-Repo recovery is no longer available.'
     fi
@@ -1322,25 +2165,40 @@ install_command() {
         canonical_user_home=$(CDPATH= cd -- "$HOME" && pwd -P)
         [ "$repository_root" != "$canonical_user_home" ] || fail 'the user home directory cannot be an installation boundary' "$readonly_exit_preflight"
     fi
-    for boundary_path in .intelli-repo .gitmodules Makefile wiki wiki/capabilities workspace; do
+    for boundary_path in .intelli-repo .gitmodules Makefile workspace; do
         [ ! -L "$repository_root/$boundary_path" ] || fail "symlinked managed boundary is prohibited: $boundary_path" "$readonly_exit_preflight"
     done
+    [ ! -e "$repository_root/.intelli-repo" ] || [ -d "$repository_root/.intelli-repo" ] || fail 'installed substrate path is not a directory' "$readonly_exit_preflight"
+    [ ! -e "$repository_root/workspace" ] || [ -d "$repository_root/workspace" ] || fail 'workspace path is not a directory' "$readonly_exit_preflight"
+    required_wiki_directories | while IFS= read -r relative_path; do
+        [ ! -L "$repository_root/$relative_path" ] || fail "symlinked required wiki path is prohibited: $relative_path" "$readonly_exit_preflight"
+        [ ! -e "$repository_root/$relative_path" ] || [ -d "$repository_root/$relative_path" ] || fail "required wiki path is not a directory: $relative_path" "$readonly_exit_preflight"
+        marker_path=$repository_root/$relative_path/.gitkeep
+        [ ! -L "$marker_path" ] || fail "symlinked wiki marker is prohibited: $relative_path/.gitkeep" "$readonly_exit_preflight"
+        [ ! -e "$marker_path" ] || [ -f "$marker_path" ] || fail "wiki marker path is not a regular file: $relative_path/.gitkeep" "$readonly_exit_preflight"
+    done
 
-    if [ "$new_repository" = false ] && validate_installation "$repository_root"; then
-        printf 'Intelli-Repo %s is already installed exactly at %s\n' "$readonly_distribution_version" "$repository_root"
-        return
+    repairing_scaffold=0
+    if [ "$new_repository" = false ] && validate_installation_core "$repository_root"; then
+        if validate_wiki_scaffold "$repository_root"; then
+            printf 'Intelli-Repo %s is already installed exactly at %s\n' "$readonly_distribution_version" "$repository_root"
+            return
+        fi
+        repairing_scaffold=1
     fi
-    if [ -e "$repository_root/.intelli-repo" ]; then
-        unexpected=$(find "$repository_root/.intelli-repo" -mindepth 1 -maxdepth 1 ! -name operations -print -quit 2>/dev/null || true)
+    if [ -e "$repository_root/.intelli-repo" ] && [ "$repairing_scaffold" -eq 0 ]; then
+        unexpected=$(find "$repository_root/.intelli-repo" -mindepth 1 -maxdepth 1 ! -name operations ! -name .env -print -quit 2>/dev/null || true)
         [ -z "$unexpected" ] || fail 'existing or partial .intelli-repo installation requires recovery before install' "$readonly_exit_preflight"
     fi
-    for target_path in .intelli-repo/base-agent .intelli-repo/operator-agent .intelli-repo/wiki-agent; do
-        [ -z "$(git -C "$repository_root" ls-files --stage -- "$target_path" 2>/dev/null || true)" ] || fail "index collision: $target_path" "$readonly_exit_preflight"
-    done
+    if [ "$repairing_scaffold" -eq 0 ]; then
+        for target_path in .intelli-repo/base-agent .intelli-repo/operator-agent .intelli-repo/wiki-agent; do
+            [ -z "$(git -C "$repository_root" ls-files --stage -- "$target_path" 2>/dev/null || true)" ] || fail "index collision: $target_path" "$readonly_exit_preflight"
+        done
+    fi
     if [ "$new_repository" = false ]; then
         [ -z "$(git -C "$repository_root" diff --cached --diff-filter=D --name-only -- .gitmodules)" ] || fail 'staged .gitmodules deletion must be resolved before install' "$readonly_exit_preflight"
     fi
-    if [ -f "$repository_root/.gitmodules" ]; then
+    if [ "$repairing_scaffold" -eq 0 ] && [ -f "$repository_root/.gitmodules" ]; then
         for component in base-agent operator-agent wiki-agent; do
             module_name=intelli-repo-$component
             component_path=.intelli-repo/$component
@@ -1365,16 +2223,14 @@ install_command() {
     initialized_repository=0
     makefile_existed=0
     modules_existed=0
-    wiki_existed=0
-    capabilities_existed=0
+    created_user_directories=''
+    created_wiki_markers=''
     workspace_existed=0
-    created_capability_dirs=''
-    [ ! -d "$repository_root/wiki" ] || wiki_existed=1
-    [ ! -d "$repository_root/wiki/capabilities" ] || capabilities_existed=1
     [ ! -d "$repository_root/workspace" ] || workspace_existed=1
-    for capability_directory in policies skills tests tools; do
-        [ -d "$repository_root/wiki/capabilities/$capability_directory" ] || created_capability_dirs="$created_capability_dirs $capability_directory"
+    for relative_path in $(required_wiki_directories); do
+        [ -d "$repository_root/$relative_path" ] || created_user_directories="$created_user_directories $relative_path"
     done
+    [ -d "$repository_root/workspace" ] || created_user_directories="$created_user_directories workspace"
     mkdir -p "$transaction_root/stage"
     [ ! -e "$repository_root/Makefile" ] || { cp -p "$repository_root/Makefile" "$transaction_root/Makefile.before"; makefile_existed=1; }
     [ ! -e "$repository_root/.gitmodules" ] || { cp -p "$repository_root/.gitmodules" "$transaction_root/gitmodules.before"; modules_existed=1; }
@@ -1394,25 +2250,33 @@ install_command() {
 
     rollback_install() {
         [ "$mutation_started" -eq 1 ] || return 0
-        for rollback_path in .intelli-repo/base-agent .intelli-repo/operator-agent .intelli-repo/wiki-agent; do
-            git -C "$repository_root" submodule deinit -f -- "$rollback_path" >/dev/null 2>&1 || true
-            git -C "$repository_root" update-index --force-remove -- "$rollback_path" >/dev/null 2>&1 || true
-            case "$repository_root/$rollback_path" in "$repository_root/.intelli-repo/"*) rm -rf -- "$repository_root/$rollback_path" ;; esac
-        done
-        rm -f -- "$repository_root/.intelli-repo/bin/intelli-repo"
-        if [ "$makefile_existed" -eq 1 ]; then cp -p "$transaction_root/Makefile.before" "$repository_root/Makefile"; else rm -f -- "$repository_root/Makefile"; fi
-        if [ "$modules_existed" -eq 1 ]; then cp -p "$transaction_root/gitmodules.before" "$repository_root/.gitmodules"; else rm -f -- "$repository_root/.gitmodules"; fi
-        if [ -s "$transaction_root/gitmodules.index.before" ]; then
-            set -- $(sed -n '1p' "$transaction_root/gitmodules.index.before")
-            git -C "$repository_root" update-index --add --cacheinfo "$1,$2,.gitmodules" >/dev/null 2>&1 || true
-        else
-            git -C "$repository_root" update-index --force-remove -- .gitmodules >/dev/null 2>&1 || true
+        if [ "$repairing_scaffold" -eq 0 ]; then
+            for rollback_path in .intelli-repo/base-agent .intelli-repo/operator-agent .intelli-repo/wiki-agent; do
+                git -C "$repository_root" submodule deinit -f -- "$rollback_path" >/dev/null 2>&1 || true
+                git -C "$repository_root" update-index --force-remove -- "$rollback_path" >/dev/null 2>&1 || true
+                case "$repository_root/$rollback_path" in "$repository_root/.intelli-repo/"*) rm -rf -- "$repository_root/$rollback_path" ;; esac
+            done
+            rm -f -- "$repository_root/.intelli-repo/bin/intelli-repo"
+            if [ "$makefile_existed" -eq 1 ]; then cp -p "$transaction_root/Makefile.before" "$repository_root/Makefile"; else rm -f -- "$repository_root/Makefile"; fi
+            if [ "$modules_existed" -eq 1 ]; then cp -p "$transaction_root/gitmodules.before" "$repository_root/.gitmodules"; else rm -f -- "$repository_root/.gitmodules"; fi
+            if [ -s "$transaction_root/gitmodules.index.before" ]; then
+                set -- $(sed -n '1p' "$transaction_root/gitmodules.index.before")
+                git -C "$repository_root" update-index --add --cacheinfo "$1,$2,.gitmodules" >/dev/null 2>&1 || true
+            else
+                git -C "$repository_root" update-index --force-remove -- .gitmodules >/dev/null 2>&1 || true
+            fi
         fi
-        for capability_directory in $created_capability_dirs; do rmdir "$repository_root/wiki/capabilities/$capability_directory" 2>/dev/null || true; done
-        if [ "$capabilities_existed" -eq 0 ]; then rmdir "$repository_root/wiki/capabilities" 2>/dev/null || true; fi
-        if [ "$wiki_existed" -eq 0 ]; then rmdir "$repository_root/wiki" 2>/dev/null || true; fi
+        for marker_path in $created_wiki_markers; do
+            [ -f "$repository_root/$marker_path" ] && [ ! -s "$repository_root/$marker_path" ] && rm -f -- "$repository_root/$marker_path" || true
+        done
+        for rollback_directory in \
+            wiki/capabilities/tools wiki/capabilities/tests wiki/capabilities/skills wiki/capabilities/policies wiki/capabilities \
+            wiki/_archive wiki/ingest wiki/logs wiki/tasks wiki/plans wiki/proposals wiki/findings wiki/decisions wiki/questions wiki/inbox wiki
+        do
+            case " $created_user_directories " in *" $rollback_directory "*) rmdir "$repository_root/$rollback_directory" 2>/dev/null || true ;; esac
+        done
         if [ "$workspace_existed" -eq 0 ]; then rmdir "$repository_root/workspace" 2>/dev/null || true; fi
-        rmdir "$repository_root/.intelli-repo/bin" "$repository_root/.intelli-repo/operations" "$repository_root/.intelli-repo" 2>/dev/null || true
+        if [ "$repairing_scaffold" -eq 0 ]; then rmdir "$repository_root/.intelli-repo/bin" "$repository_root/.intelli-repo/operations" "$repository_root/.intelli-repo" 2>/dev/null || true; fi
         if [ "$initialized_repository" -eq 1 ]; then
             printf 'intelli-repo: initialized Git repository retained for recoverability at %s\n' "$repository_root" >&2
         fi
@@ -1448,6 +2312,7 @@ install_command() {
     printf '  target: %s\n' "$repository_root"
     printf '  distribution: %s (%s)\n' "$readonly_distribution_version" "$selection_context"
     printf '  initialize Git repository: %s\n' "$new_repository"
+    printf '  repair missing generic wiki scaffold only: %s\n' "$repairing_scaffold"
     printf '  inspected state: staged=%s unstaged=%s untracked=%s ignored=%s existing-submodules=%s\n' "$staged_count" "$unstaged_count" "$untracked_count" "$ignored_count" "$existing_submodule_count"
     printf '  optional Make: %s\n' "$make_status"
     printf '%s\n' '  install exact submodules:'
@@ -1456,7 +2321,10 @@ install_command() {
     printf '    .intelli-repo/wiki-agent @ %s from %s\n' "$readonly_wiki_agent_commit" "$wiki_agent_url"
     printf '%s\n' '  install command: .intelli-repo/bin/intelli-repo'
     printf '%s\n' '  update managed region: Makefile'
-    printf '%s\n' '  create user-owned directories if absent: wiki/capabilities/{policies,skills,tests,tools}, workspace'
+    printf '%s\n' '  create user-owned directories if absent:'
+    required_wiki_directories | sed 's/^/    /'
+    printf '%s\n' '    workspace'
+    printf '%s\n' '  add nonsemantic .gitkeep only to otherwise-empty wiki directories where absent'
     printf '%s\n' '  configuration: repo-agent-config.yaml remains absent or unchanged'
     printf '%s\n' '  Git effects: update and stage .gitmodules, stage three exact gitlinks, and register local submodule configuration'
     printf '%s\n' '  excluded: commit, push, tag, publish, PATH changes, and unrelated staging'
@@ -1464,7 +2332,7 @@ install_command() {
     if [ "$dry_run" -eq 1 ]; then transaction_active=0; return; fi
     approve_proposal "$approved" 'Apply this exact installation proposal? Type yes: '
 
-    for component_record in \
+    if [ "$repairing_scaffold" -eq 0 ]; then for component_record in \
         "base-agent|$readonly_base_agent_commit|$base_agent_url" \
         "operator-agent|$readonly_operator_agent_commit|$operator_agent_url" \
         "wiki-agent|$readonly_wiki_agent_commit|$wiki_agent_url"
@@ -1476,7 +2344,7 @@ install_command() {
         git clone -q --no-checkout "$component_url" "$transaction_root/stage/$component" || fail "could not clone $component" "$readonly_exit_preflight"
         git -C "$transaction_root/stage/$component" checkout -q --detach "$component_commit" || fail "could not resolve exact $component commit" "$readonly_exit_compatibility"
         [ "$(git -C "$transaction_root/stage/$component" rev-parse HEAD)" = "$component_commit" ] || fail "exact $component commit verification failed" "$readonly_exit_compatibility"
-    done
+    done; fi
 
     if [ "$new_repository" = true ]; then
         mkdir -p "$repository_root"
@@ -1485,13 +2353,25 @@ install_command() {
     fi
     transaction_active=1
     mutation_started=1
-    mkdir -p "$repository_root/.intelli-repo/bin" "$repository_root/.intelli-repo/operations" || fail 'could not create installed substrate directories' "$readonly_exit_mutation"
-    cp -p "$0" "$repository_root/.intelli-repo/bin/intelli-repo" || fail 'could not install command facade' "$readonly_exit_mutation"
-    chmod 0755 "$repository_root/.intelli-repo/bin/intelli-repo" || fail 'could not set command mode' "$readonly_exit_mutation"
-    cp -p "$transaction_root/Makefile.after" "$repository_root/Makefile" || fail 'could not update managed Makefile region' "$readonly_exit_mutation"
-    mkdir -p "$repository_root/wiki/capabilities/policies" "$repository_root/wiki/capabilities/skills" "$repository_root/wiki/capabilities/tests" "$repository_root/wiki/capabilities/tools" "$repository_root/workspace" || fail 'could not create convention-first user directories' "$readonly_exit_mutation"
+    if [ "$repairing_scaffold" -eq 0 ]; then
+        mkdir -p "$repository_root/.intelli-repo/bin" "$repository_root/.intelli-repo/operations" || fail 'could not create installed substrate directories' "$readonly_exit_mutation"
+        cp -p "$0" "$repository_root/.intelli-repo/bin/intelli-repo" || fail 'could not install command facade' "$readonly_exit_mutation"
+        chmod 0755 "$repository_root/.intelli-repo/bin/intelli-repo" || fail 'could not set command mode' "$readonly_exit_mutation"
+        cp -p "$transaction_root/Makefile.after" "$repository_root/Makefile" || fail 'could not update managed Makefile region' "$readonly_exit_mutation"
+    fi
+    required_wiki_directories | while IFS= read -r relative_path; do
+        mkdir -p "$repository_root/$relative_path" || exit 1
+    done || fail 'could not create complete generic wiki scaffold' "$readonly_exit_mutation"
+    mkdir -p "$repository_root/workspace" || fail 'could not create workspace directory' "$readonly_exit_mutation"
+    for relative_path in $(required_wiki_directories); do
+        marker_path=$repository_root/$relative_path/.gitkeep
+        if [ ! -e "$marker_path" ] && [ -z "$(find "$repository_root/$relative_path" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)" ]; then
+            : >"$marker_path" || fail 'could not preserve empty wiki directories with markers' "$readonly_exit_mutation"
+            created_wiki_markers="$created_wiki_markers $relative_path/.gitkeep"
+        fi
+    done
 
-    for component_record in \
+    if [ "$repairing_scaffold" -eq 0 ]; then for component_record in \
         "base-agent|$readonly_base_agent_commit|$base_agent_url" \
         "operator-agent|$readonly_operator_agent_commit|$operator_agent_url" \
         "wiki-agent|$readonly_wiki_agent_commit|$wiki_agent_url"
@@ -1509,10 +2389,11 @@ install_command() {
         mv "$transaction_root/stage/$component" "$repository_root/$component_path" || fail "could not install $component checkout" "$readonly_exit_mutation"
         git -C "$repository_root" update-index --add --cacheinfo "160000,$component_commit,$component_path" || fail "could not stage exact $component gitlink" "$readonly_exit_mutation"
     done
-    cp -p "$transaction_root/gitmodules.working.after" "$repository_root/.gitmodules" || fail 'could not update .gitmodules working tree' "$readonly_exit_mutation"
-    modules_index_blob=$(git -C "$repository_root" hash-object -w --path=.gitmodules "$transaction_root/gitmodules.index.after") || fail 'could not create .gitmodules index object' "$readonly_exit_mutation"
-    git -C "$repository_root" update-index --add --cacheinfo "100644,$modules_index_blob,.gitmodules" || fail 'could not stage .gitmodules integration' "$readonly_exit_mutation"
-    git -C "$repository_root" submodule init -- .intelli-repo/base-agent .intelli-repo/operator-agent .intelli-repo/wiki-agent >/dev/null 2>&1 || fail 'could not register installed submodules' "$readonly_exit_mutation"
+        cp -p "$transaction_root/gitmodules.working.after" "$repository_root/.gitmodules" || fail 'could not update .gitmodules working tree' "$readonly_exit_mutation"
+        modules_index_blob=$(git -C "$repository_root" hash-object -w --path=.gitmodules "$transaction_root/gitmodules.index.after") || fail 'could not create .gitmodules index object' "$readonly_exit_mutation"
+        git -C "$repository_root" update-index --add --cacheinfo "100644,$modules_index_blob,.gitmodules" || fail 'could not stage .gitmodules integration' "$readonly_exit_mutation"
+        git -C "$repository_root" submodule init -- .intelli-repo/base-agent .intelli-repo/operator-agent .intelli-repo/wiki-agent >/dev/null 2>&1 || fail 'could not register installed submodules' "$readonly_exit_mutation"
+    fi
 
     validate_installation "$repository_root" || fail 'installed runtime validation failed' "$readonly_exit_validation"
     operation_id=$(date -u '+%Y%m%dT%H%M%SZ')-install-$$.yaml
@@ -1543,6 +2424,8 @@ case "$command_name" in
     doctor) doctor_command "$@" ;;
     uninstall) uninstall_command "$@" ;;
     _apply-update) apply_update_command "$@" ;;
+    _credential-consume) credential_consume_command "$@" ;;
+    _dotenv-read) dotenv_read_command "$@" ;;
     lint|audit|ingest|task|release) dispatch_capability "$command_name" "$@" ;;
     *) usage >&2; fail "unknown command: $command_name" ;;
 esac

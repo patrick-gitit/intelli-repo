@@ -4,8 +4,16 @@ All notable user-visible changes to Intelli-Repo are documented here. Versions f
 
 ## Unreleased
 
-No unreleased user-visible changes are currently recorded.
+## v0.1.0-beta.2 — 2026-08-26
 
+### Highlights
+
+- Base, wiki, and operator agents now ship their required executable capability baselines.
+- The public README and banner are generated from the committed design source.
+- New installations create every standard wiki register and preserve user-owned content.
+- Compatible beta.1 updates backfill missing scaffold paths and preserve later user additions during rollback.
+- Release notes, checksums, and provenance can be projected into a separately approved GitHub prerelease without allowing the hosting interface to mutate Git refs.
+- Linux users can explicitly select a repository-local .intelli-repo/.env provider, retrieve one named value through a bounded consumer, and check readiness without exposing the value. Windows and macOS support remain unavailable pending future validation.
 ## v0.1.0-beta.1 — 2026-08-20
 
 First public beta of the exact-pinned Intelli-Repo agent substrate and repository-local lifecycle tooling.

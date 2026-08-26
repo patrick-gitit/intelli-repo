@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-readonly_default_version='v0.1.0-beta.1'
+readonly_default_version='v0.1.0-beta.2'
 readonly_public_base='https://raw.githubusercontent.com/patrick-gitit/intelli-repo'
 
 fail() {

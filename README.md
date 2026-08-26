@@ -4,7 +4,7 @@
 
 Intelli-Repo turns an ordinary Git repository into a structured, inspectable environment for doing valuable work—and improving how that work gets done. Knowledge stays close to the work it informs. Decisions and policies make direction explicit, while tasks turn intent into action. Evidence preserves what happened and why. Humans and agents collaborate in the same version-controlled space, keeping the journey from idea to outcome understandable, reusable, and continuously improvable.
 
-> **Beta status:** `v0.1.0-beta.1` is the current public beta. Its pre-1.0 compatibility contract may change in later releases.
+> **Beta status:** `v0.1.0-beta.2` is the current public beta. Its pre-1.0 compatibility contract may change in later releases.
 
 ## Install
 
@@ -19,7 +19,7 @@ The script on `main` points to one approved, immutable release. It does not sear
 To install the current beta from its immutable tag, use:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/patrick-gitit/intelli-repo/v0.1.0-beta.1/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/patrick-gitit/intelli-repo/v0.1.0-beta.2/install.sh | sh
 ```
 
 You can also use `--version VERSION` when you need an explicit immutable version. Before running versioned content, the bootstrap verifies the selected tag's provenance and checksums.
@@ -108,11 +108,19 @@ To enable or disable an agent, use:
 intelli-repo configure --set-agent NAME=enabled|disabled
 ```
 
+To explicitly select beta.2 local dotenv retrieval for one named value, use:
+
+```sh
+intelli-repo configure --set-secret-provider dotenv --set-secret-name NAME
+```
+
+Beta.2 dotenv support is verified for Linux only. Windows and macOS support is unavailable until their native validation tasks pass in a future release.
+
 Intelli-Repo displays the proposed configuration before writing it and requires approval. The resulting `repo-agent-config.yaml` follows the strict version 1 schema. The operation receipt retains enough prior state to recover from a failed change.
 
 ### Doctor
 
-`doctor` is read-only. It checks the installed runtime, command, agent pins, submodule integrity, managed integration, configuration, operation state, optional Make support, and available rollback evidence.
+`doctor` is read-only. It checks the installed runtime, command, agent pins, submodule integrity, managed integration, configuration, selected dotenv readiness, operation state, optional Make support, and available rollback evidence. A dotenv readiness check validates the fixed file, access controls, Git exclusion, complete literal grammar, and exact configured name while discarding the value.
 
 Each applicable check has one of these results:
 
@@ -121,6 +129,20 @@ Each applicable check has one of these results:
 - `warning` identifies a concern that does not make the installation invalid
 - `not-applicable` means the check does not apply to the current state
 - `skipped` means the check could not or did not need to run
+
+### Local dotenv secrets — Linux beta support
+
+Dotenv is optional and never selected automatically. From the repository root:
+
+1. Select exactly one name with `intelli-repo configure --set-secret-provider dotenv --set-secret-name NAME`. After approval, configure adds the exact standalone `.intelli-repo/.env` rule to the root `.gitignore` when absent while preserving existing bytes. Review and commit that ignore protection before creating the secret file.
+2. Create `.intelli-repo/.env` yourself. Do not paste its values into chat, commands, screenshots, issues, logs, or documentation.
+3. Restrict the file with `chmod 600 .intelli-repo/.env` (read-only owner mode `0400` is also accepted).
+4. Add literal `NAME=value` assignments. Multiple unrelated names are allowed; names must be unique. Shell syntax, `export`, interpolation, command substitution, includes, multiline values, and executable expressions are rejected rather than evaluated.
+5. Run `intelli-repo doctor`. It reports a safe reason such as missing file, unsafe path, wrong owner, unsafe permissions, Git exposure, malformed grammar, duplicate name, missing name, empty value, or excessive size without printing any value.
+
+`.intelli-repo/.env` stores secrets as plaintext on this device. Intelli-Repo checks access controls, Git exclusion, file format, and bounded delivery, but operating-system administrators, backups, malware, crash data, or other software with sufficient access may still read it. You create, protect, rotate, revoke, and delete these values. Intelli-Repo uses only the exact name selected for the approved consumer and does not use this file to authenticate GitHub CLI.
+
+Install never creates or populates the file. Update, rollback, and ordinary uninstall preserve it. Remove or rotate a value by editing your user-owned file and rerunning `doctor`; Intelli-Repo does not create, rotate, revoke, synchronize, or delete credentials. GitHub Presentation uses only an already configured and authenticated `gh` client and cannot select dotenv. Beta.2 includes no keychain, OAuth/connector, interactive-entry, ambient-variable, discovery, or fallback provider.
 
 ### Uninstall
 
