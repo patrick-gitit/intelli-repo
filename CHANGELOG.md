@@ -4,11 +4,17 @@ All notable user-visible changes to Intelli-Repo are documented here. Versions f
 
 ## Unreleased
 
+## v0.1.0-beta.2.2 — 2026-08-26
+
+### Highlights
+
+- The stable and immutable bootstraps now recognize only the exact beta.1 command and hand it to the verified current migration path, so compatible beta.1 repositories can receive complete-manifest releases without using the obsolete beta.1 updater.
 ## v0.1.0-beta.2.1 — 2026-08-26
 
 ### Highlights
 
 - The stable and immutable bootstraps now accept and verify the generated banner and versioned release-note checksum entries instead of rejecting their own release manifest.
+
 ## v0.1.0-beta.2 — 2026-08-26
 
 ### Highlights

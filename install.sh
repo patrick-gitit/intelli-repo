@@ -1,8 +1,9 @@
 #!/bin/sh
 set -eu
 
-readonly_default_version='v0.1.0-beta.2.1'
+readonly_default_version='v0.1.0-beta.2.2'
 readonly_public_base='https://raw.githubusercontent.com/patrick-gitit/intelli-repo'
+readonly_beta1_command_sha256='4fb7a041652599bccb41d55c5821a839aae4a96357d9366946ed5b3063c3d273'
 
 fail() {
     printf 'intelli-repo bootstrap: %s\n' "$1" >&2
@@ -46,7 +47,8 @@ while [ "$#" -gt 0 ]; do
 Usage: install.sh [--version VERSION] [intelli-repo install options]
 
 Downloads and verifies the immutable Intelli-Repo command for VERSION, then
-runs its install operation. The default approved release is
+runs its install operation. For an exact compatible beta.1 installation, the
+verified current bootstrap performs the supported migration transition. The default approved release is
 $readonly_default_version.
 USAGE
             exit 0
@@ -108,6 +110,27 @@ done <"$bootstrap_directory/SHA256SUMS"
 for expected_path in $expected_paths; do
     case " $checksum_paths " in *" $expected_path "*) ;; *) fail "missing checksum path: $expected_path" 65 ;; esac
 done
+
+legacy_repository=.
+legacy_expect_repository_value=0
+for install_argument in "$@"; do
+    if [ "$legacy_expect_repository_value" -eq 1 ]; then
+        legacy_repository=$install_argument
+        legacy_expect_repository_value=0
+    elif [ "$install_argument" = --repo ]; then
+        legacy_expect_repository_value=1
+    fi
+done
+legacy_command=$legacy_repository/.intelli-repo/bin/intelli-repo
+if [ -f "$legacy_command" ] && [ ! -L "$legacy_command" ] \
+    && [ "$(digest_file "$legacy_command")" = "$readonly_beta1_command_sha256" ]; then
+    INTELLI_REPO_BOOTSTRAP_VERSION=$version \
+    INTELLI_REPO_BOOTSTRAP_PROVENANCE=$bootstrap_directory/PROVENANCE.yaml \
+    INTELLI_REPO_BOOTSTRAP_CHECKSUMS=$bootstrap_directory/SHA256SUMS \
+    INTELLI_REPO_BOOTSTRAP_SELECTION=$selection_context \
+        "$bootstrap_directory/intelli-repo" _apply-update --from-version v0.1.0-beta.1 --from-protocol 1 "$@"
+    exit $?
+fi
 
 INTELLI_REPO_BOOTSTRAP_VERSION=$version \
 INTELLI_REPO_BOOTSTRAP_PROVENANCE=$bootstrap_directory/PROVENANCE.yaml \

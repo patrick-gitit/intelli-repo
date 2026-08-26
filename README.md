@@ -4,7 +4,7 @@
 
 Intelli-Repo turns an ordinary Git repository into a structured, inspectable environment for doing valuable work—and improving how that work gets done. Knowledge stays close to the work it informs. Decisions and policies make direction explicit, while tasks turn intent into action. Evidence preserves what happened and why. Humans and agents collaborate in the same version-controlled space, keeping the journey from idea to outcome understandable, reusable, and continuously improvable.
 
-> **Beta status:** `v0.1.0-beta.2.1` is the current public beta. Its pre-1.0 compatibility contract may change in later releases.
+> **Beta status:** `v0.1.0-beta.2.2` is the current public beta. Its pre-1.0 compatibility contract may change in later releases.
 
 ## Install
 
@@ -19,10 +19,14 @@ The script on `main` points to one approved, immutable release. It does not sear
 To install the current beta from its immutable tag, use:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/patrick-gitit/intelli-repo/v0.1.0-beta.2.1/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/patrick-gitit/intelli-repo/v0.1.0-beta.2.2/install.sh | sh
 ```
 
 You can also use `--version VERSION` when you need an explicit immutable version. Before running versioned content, the bootstrap verifies the selected tag's provenance and checksums.
+
+### Compatible beta.1 upgrade
+
+To upgrade an exact, unmodified `v0.1.0-beta.1` installation, run the current stable or immutable bootstrap again with the same `--repo` target. The verified current bootstrap detects the exact beta.1 command and performs the supported migration transition itself; do not rely on beta.1's older `intelli-repo update` command to acquire a beta.2-style release manifest.
 
 Git commits identify the exact content. Submodule gitlinks identify the exact agent revisions. Immutable annotated tags identify public releases. Together, these records provide the version authority for Intelli-Repo.
 
