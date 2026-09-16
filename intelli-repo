@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-readonly_distribution_version='v0.1.0-beta.2.2'
+readonly_distribution_version='v0.1.0-beta.2.3'
 readonly_base_agent_commit='a6d697c28238f2c2b3f5bbf3ce24f39e39c4ccaf'
 readonly_operator_agent_commit='49175ac1f1a7bf1e57c74d2d34c9567c916102d5'
 readonly_wiki_agent_commit='a6d2ebfb6cfb78076ad6d06dc87f1aed7ce57ab9'
@@ -1436,12 +1436,13 @@ acquire_update_command() {
     chmod 0600 "$acquisition_root/PROVENANCE.yaml" "$acquisition_root/SHA256SUMS"
     provenance_version=$(yaml_scalar distribution_version "$acquisition_root/PROVENANCE.yaml") || fail 'invalid update provenance' "$readonly_exit_preflight"
     [ "$provenance_version" = "$target_version" ] || fail 'requested update version does not match provenance' "$readonly_exit_compatibility"
-    expected_paths='CHANGELOG.md LICENSE PROVENANCE.yaml README.md SECURITY.md install.sh intelli-repo'
+    expected_paths="CHANGELOG.md LICENSE PROVENANCE.yaml README.md SECURITY.md install.sh intelli-repo readme-banner.png release-notes/$target_version.md"
     checksum_paths=''
     while IFS= read -r checksum_line || [ -n "$checksum_line" ]; do
-        printf '%s\n' "$checksum_line" | grep -Eq '^[0-9a-f]{64}  [A-Za-z0-9][A-Za-z0-9._-]*$' || fail 'invalid update SHA256SUMS syntax or path' "$readonly_exit_preflight"
+        printf '%s\n' "$checksum_line" | grep -Eq '^[0-9a-f]{64}  [A-Za-z0-9][A-Za-z0-9._/-]*$' || fail 'invalid update SHA256SUMS syntax or path' "$readonly_exit_preflight"
         checksum_digest=${checksum_line%%  *}
         checksum_path=${checksum_line#*  }
+        case "$checksum_path" in /*|../*|*/../*|*/..|*//*|*/./*|*/.) fail "unsafe update checksum path: $checksum_path" "$readonly_exit_preflight" ;; esac
         case " $expected_paths " in *" $checksum_path "*) ;; *) fail "unexpected update checksum path: $checksum_path" "$readonly_exit_preflight" ;; esac
         case " $checksum_paths " in *" $checksum_path "*) fail "duplicate update checksum path: $checksum_path" "$readonly_exit_preflight" ;; esac
         checksum_paths="$checksum_paths $checksum_path"

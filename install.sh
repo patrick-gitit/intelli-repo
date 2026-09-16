@@ -1,9 +1,10 @@
 #!/bin/sh
 set -eu
 
-readonly_default_version='v0.1.0-beta.2.2'
+readonly_default_version='v0.1.0-beta.2.3'
 readonly_public_base='https://raw.githubusercontent.com/patrick-gitit/intelli-repo'
 readonly_beta1_command_sha256='4fb7a041652599bccb41d55c5821a839aae4a96357d9366946ed5b3063c3d273'
+readonly_beta22_command_sha256='e2b0959e23ff415a9be555bd11d31ae096de0aacbc04f4e278206591fba63b14'
 
 fail() {
     printf 'intelli-repo bootstrap: %s\n' "$1" >&2
@@ -47,8 +48,9 @@ while [ "$#" -gt 0 ]; do
 Usage: install.sh [--version VERSION] [intelli-repo install options]
 
 Downloads and verifies the immutable Intelli-Repo command for VERSION, then
-runs its install operation. For an exact compatible beta.1 installation, the
-verified current bootstrap performs the supported migration transition. The default approved release is
+runs its install operation. For an exact compatible prior installation whose
+updater cannot acquire the current manifest, the verified current bootstrap
+performs the supported migration transition. The default approved release is
 $readonly_default_version.
 USAGE
             exit 0
@@ -122,13 +124,21 @@ for install_argument in "$@"; do
     fi
 done
 legacy_command=$legacy_repository/.intelli-repo/bin/intelli-repo
-if [ -f "$legacy_command" ] && [ ! -L "$legacy_command" ] \
-    && [ "$(digest_file "$legacy_command")" = "$readonly_beta1_command_sha256" ]; then
+legacy_from_version=''
+legacy_from_protocol=''
+if [ -f "$legacy_command" ] && [ ! -L "$legacy_command" ]; then
+    legacy_command_sha256=$(digest_file "$legacy_command")
+    case "$legacy_command_sha256" in
+        "$readonly_beta1_command_sha256") legacy_from_version=v0.1.0-beta.1; legacy_from_protocol=1 ;;
+        "$readonly_beta22_command_sha256") legacy_from_version=v0.1.0-beta.2.2; legacy_from_protocol=1 ;;
+    esac
+fi
+if [ -n "$legacy_from_version" ] && [ "$legacy_from_version" != "$version" ]; then
     INTELLI_REPO_BOOTSTRAP_VERSION=$version \
     INTELLI_REPO_BOOTSTRAP_PROVENANCE=$bootstrap_directory/PROVENANCE.yaml \
     INTELLI_REPO_BOOTSTRAP_CHECKSUMS=$bootstrap_directory/SHA256SUMS \
     INTELLI_REPO_BOOTSTRAP_SELECTION=$selection_context \
-        "$bootstrap_directory/intelli-repo" _apply-update --from-version v0.1.0-beta.1 --from-protocol 1 "$@"
+        "$bootstrap_directory/intelli-repo" _apply-update --from-version "$legacy_from_version" --from-protocol "$legacy_from_protocol" "$@"
     exit $?
 fi
 
