@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-readonly_default_version='v0.1.0-beta.2.3'
+readonly_default_version='v0.1.0-beta.2.4'
 readonly_public_base='https://raw.githubusercontent.com/patrick-gitit/intelli-repo'
 readonly_beta1_command_sha256='4fb7a041652599bccb41d55c5821a839aae4a96357d9366946ed5b3063c3d273'
 readonly_beta22_command_sha256='e2b0959e23ff415a9be555bd11d31ae096de0aacbc04f4e278206591fba63b14'
