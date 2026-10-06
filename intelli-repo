@@ -1,10 +1,10 @@
 #!/bin/sh
 set -eu
 
-readonly_distribution_version='v0.1.0-beta.2.4'
+readonly_distribution_version='v0.1.0-beta.2.5'
 readonly_base_agent_commit='a6d697c28238f2c2b3f5bbf3ce24f39e39c4ccaf'
 readonly_operator_agent_commit='49175ac1f1a7bf1e57c74d2d34c9567c916102d5'
-readonly_wiki_agent_commit='a6d2ebfb6cfb78076ad6d06dc87f1aed7ce57ab9'
+readonly_wiki_agent_commit='6c41f0b6392da82650a9112c0b2f9386b42c34c5'
 readonly_supported_beta_1_base_agent_commit='9b3eec9f0566da3ace5ab0cb47d4c5a2dc1d9b0a'
 readonly_supported_beta_1_operator_agent_commit='e8aec0e5f88af5624aa12f37656c9ef7243f70ca'
 readonly_supported_beta_1_wiki_agent_commit='3543fdb11791fd2298c62bb41301bec628768501'
@@ -901,7 +901,7 @@ index_commit() {
 required_wiki_directories() {
     cat <<'EOF'
 wiki
-wiki/inbox
+wiki/_inbox
 wiki/questions
 wiki/decisions
 wiki/findings
@@ -909,13 +909,13 @@ wiki/proposals
 wiki/plans
 wiki/tasks
 wiki/logs
-wiki/ingest
+wiki/_ingest
 wiki/_archive
-wiki/capabilities
-wiki/capabilities/policies
-wiki/capabilities/skills
-wiki/capabilities/tests
-wiki/capabilities/tools
+wiki/_capabilities
+wiki/_capabilities/policies
+wiki/_capabilities/skills
+wiki/_capabilities/tests
+wiki/_capabilities/tools
 EOF
 }
 
@@ -1113,7 +1113,7 @@ components:
   operator_agent: "$readonly_operator_agent_commit"
   wiki_agent: "$readonly_wiki_agent_commit"
 git_index_changes_disclosed: true
-proposed_user_directories: ["wiki/inbox", "wiki/questions", "wiki/decisions", "wiki/findings", "wiki/proposals", "wiki/plans", "wiki/tasks", "wiki/logs", "wiki/ingest", "wiki/_archive", "wiki/capabilities/policies", "wiki/capabilities/skills", "wiki/capabilities/tests", "wiki/capabilities/tools", "workspace"]
+proposed_user_directories: ["wiki/_inbox", "wiki/questions", "wiki/decisions", "wiki/findings", "wiki/proposals", "wiki/plans", "wiki/tasks", "wiki/logs", "wiki/_ingest", "wiki/_archive", "wiki/_capabilities/policies", "wiki/_capabilities/skills", "wiki/_capabilities/tests", "wiki/_capabilities/tools", "workspace"]
 created_user_directories: $(yaml_path_list "$created_user_directories")
 created_wiki_markers: $(yaml_path_list "$created_wiki_markers")
 publication_performed: false
@@ -2271,8 +2271,8 @@ install_command() {
             [ -f "$repository_root/$marker_path" ] && [ ! -s "$repository_root/$marker_path" ] && rm -f -- "$repository_root/$marker_path" || true
         done
         for rollback_directory in \
-            wiki/capabilities/tools wiki/capabilities/tests wiki/capabilities/skills wiki/capabilities/policies wiki/capabilities \
-            wiki/_archive wiki/ingest wiki/logs wiki/tasks wiki/plans wiki/proposals wiki/findings wiki/decisions wiki/questions wiki/inbox wiki
+            wiki/_capabilities/tools wiki/_capabilities/tests wiki/_capabilities/skills wiki/_capabilities/policies wiki/_capabilities \
+            wiki/_archive wiki/_ingest wiki/logs wiki/tasks wiki/plans wiki/proposals wiki/findings wiki/decisions wiki/questions wiki/_inbox wiki
         do
             case " $created_user_directories " in *" $rollback_directory "*) rmdir "$repository_root/$rollback_directory" 2>/dev/null || true ;; esac
         done
