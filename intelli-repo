@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-readonly_distribution_version='v0.1.0-beta.2.5'
+readonly_distribution_version='v0.1.0-beta.2.6'
 readonly_base_agent_commit='a6d697c28238f2c2b3f5bbf3ce24f39e39c4ccaf'
 readonly_operator_agent_commit='49175ac1f1a7bf1e57c74d2d34c9567c916102d5'
 readonly_wiki_agent_commit='6c41f0b6392da82650a9112c0b2f9386b42c34c5'
@@ -36,11 +36,13 @@ Lifecycle commands:
   uninstall    Remove owned integration; preserve user data by default
 
 Capability status:
-  lint         Unavailable; no installed command dispatcher
-  audit        Unavailable; no installed command dispatcher
-  ingest       Unavailable; no installed command dispatcher
-  task         Unavailable; no installed command dispatcher
-  release      Unavailable; no installed command dispatcher
+  capabilities List the harness-neutral installed capability catalog
+  capability   Show a capability record or retrieve skill instructions
+  lint         Planned capability; inspect with capability show lint
+  audit        Agent-mediated audit-wiki alias
+  ingest       Agent-mediated ingest-and-archive alias
+  task         Agent-mediated manage-plan-task-lifecycle alias
+  release      Planned capability; inspect with capability show release
 
 Global commands:
   version      Print the exact command version
@@ -1085,6 +1087,7 @@ validate_installation_core() {
     [ "$(awk '/^# BEGIN INTELLI-REPO MANAGED v1$/ { inside = 1 } inside { count++ } /^# END INTELLI-REPO MANAGED v1$/ { print count; exit }' "$repository_root/Makefile")" -eq 5 ] || return 1
     grep -Fqx '.PHONY: intelli-repo-configure intelli-repo-update intelli-repo-doctor intelli-repo-lint intelli-repo-audit intelli-repo-ingest intelli-repo-task intelli-repo-release intelli-repo-uninstall' "$repository_root/Makefile" || return 1
     grep -Fqx '	$(CURDIR)/.intelli-repo/bin/intelli-repo $(@:intelli-repo-%=%) --repo $(CURDIR)' "$repository_root/Makefile" || return 1
+    capability_validate_catalog "$repository_root" || return 1
 }
 
 validate_installation() {
@@ -1226,6 +1229,12 @@ doctor_command() {
         doctor_result pass wiki.scaffold 'complete generic user-owned scaffold'
     else
         doctor_result fail wiki.scaffold 'missing, symlinked, or wrong-type required directory'
+    fi
+
+    if capability_validate_catalog "$repository_root"; then
+        doctor_result pass capability.catalog 'schema version 1 packages resolve without ambiguity'
+    else
+        doctor_result fail capability.catalog 'invalid, unsafe, or ambiguous capability package'
     fi
 
     stale_operation=$(find "$repository_root/.intelli-repo/operations" -maxdepth 1 -type f -name '*.pending' -print -quit 2>/dev/null || true)
@@ -2414,8 +2423,460 @@ dispatch_capability() {
     exec "$handler" "$@"
 }
 
-unavailable_capability() {
-    fail "capability is unavailable in $readonly_distribution_version: $1" "$readonly_exit_compatibility"
+capability_metadata_scalar() {
+    capability_metadata_file=$1
+    capability_metadata_scope=$2
+    capability_metadata_key=$3
+    awk -v scope="$capability_metadata_scope" -v key="$capability_metadata_key" '
+        NR == 1 && $0 == "---" { frontmatter = 1; next }
+        frontmatter && $0 == "---" { frontmatter = 0; done = 1; next }
+        !frontmatter || done { next }
+        scope == "top" && $0 ~ /^[^[:space:]][^:]*:/ {
+            separator = index($0, ":")
+            candidate = substr($0, 1, separator - 1)
+            value = substr($0, separator + 1)
+            sub(/^[[:space:]]+/, "", value); sub(/[[:space:]]+$/, "", value)
+            if (candidate == key) { count++; result = value }
+        }
+        scope == "intelli_repo" && $0 ~ /^  [^[:space:]][^:]*:/ {
+            line = substr($0, 3)
+            separator = index(line, ":")
+            candidate = substr(line, 1, separator - 1)
+            value = substr(line, separator + 1)
+            sub(/^[[:space:]]+/, "", value); sub(/[[:space:]]+$/, "", value)
+            if (candidate == key) { count++; result = value }
+        }
+        END {
+            if (count != 1) exit 1
+            if (result ~ /^"[^"]*"$/) result = substr(result, 2, length(result) - 2)
+            print result
+        }
+    ' "$capability_metadata_file"
+}
+
+capability_id_valid() {
+    printf '%s\n' "$1" | grep -Eq '^[a-z0-9]+(-[a-z0-9]+)*$'
+}
+
+capability_alias_target() {
+    case "$1" in
+        audit) printf '%s\n' audit-wiki ;;
+        ingest) printf '%s\n' ingest-and-archive ;;
+        task) printf '%s\n' manage-plan-task-lifecycle ;;
+        lint) printf '%s\n' lint-wiki ;;
+        release) printf '%s\n' release-workflow ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+capability_aliases_for() {
+    case "$1" in
+        audit-wiki) printf '%s\n' audit ;;
+        ingest-and-archive) printf '%s\n' ingest ;;
+        manage-plan-task-lifecycle) printf '%s\n' task ;;
+        lint-wiki) printf '%s\n' lint ;;
+        release-workflow) printf '%s\n' release ;;
+        *) printf '%s\n' '' ;;
+    esac
+}
+
+capability_agent_enabled() {
+    capability_agent_name=$1
+    capability_configuration_key=${capability_agent_name%-agent}_agent
+    [ "$(configuration_value "$repository_root/repo-agent-config.yaml" "$capability_configuration_key" enabled)" = enabled ]
+}
+
+capability_package_valid() {
+    capability_package_file=$1
+    capability_expected_id=$2
+    capability_expected_agent=$3
+    [ -f "$capability_package_file" ] && [ ! -L "$capability_package_file" ] && [ -r "$capability_package_file" ] || return 1
+    capability_package_directory=${capability_package_file%/*}
+    [ -d "$capability_package_directory" ] && [ ! -L "$capability_package_directory" ] || return 1
+    capability_package_skills=${capability_package_directory%/*}
+    [ -d "$capability_package_skills" ] && [ ! -L "$capability_package_skills" ] || return 1
+    capability_name=$(capability_metadata_scalar "$capability_package_file" top name 2>/dev/null || true)
+    capability_description=$(capability_metadata_scalar "$capability_package_file" top description 2>/dev/null || true)
+    capability_identity=$(capability_metadata_scalar "$capability_package_file" intelli_repo capability_id 2>/dev/null || true)
+    capability_agent_value=$(capability_metadata_scalar "$capability_package_file" intelli_repo agent 2>/dev/null || true)
+    capability_permission_value=$(capability_metadata_scalar "$capability_package_file" intelli_repo permissions 2>/dev/null || true)
+    [ "$capability_name" = "$capability_expected_id" ] || return 1
+    [ -n "$capability_description" ] || return 1
+    [ "$capability_identity" = "$capability_expected_id" ] || return 1
+    [ "$capability_agent_value" = "$capability_expected_agent" ] || return 1
+    capability_id_valid "$capability_permission_value" || return 1
+}
+
+capability_local_package_valid() {
+    capability_local_file=$1
+    capability_local_id=$2
+    [ -f "$capability_local_file" ] && [ ! -L "$capability_local_file" ] && [ -r "$capability_local_file" ] || return 1
+    capability_local_directory=${capability_local_file%/*}
+    [ -d "$capability_local_directory" ] && [ ! -L "$capability_local_directory" ] || return 1
+    capability_local_skills=${capability_local_directory%/*}
+    capability_local_capabilities=${capability_local_skills%/*}
+    [ -d "$capability_local_skills" ] && [ ! -L "$capability_local_skills" ] || return 1
+    [ -d "$capability_local_capabilities" ] && [ ! -L "$capability_local_capabilities" ] || return 1
+    capability_local_name=$(capability_metadata_scalar "$capability_local_file" top name 2>/dev/null || true)
+    capability_local_description=$(capability_metadata_scalar "$capability_local_file" top description 2>/dev/null || true)
+    capability_local_identity=$(capability_metadata_scalar "$capability_local_file" intelli_repo capability_id 2>/dev/null || true)
+    capability_local_agent=$(capability_metadata_scalar "$capability_local_file" intelli_repo agent 2>/dev/null || true)
+    capability_local_permissions=$(capability_metadata_scalar "$capability_local_file" intelli_repo permissions 2>/dev/null || true)
+    [ "$capability_local_name" = "$capability_local_id" ] && [ -n "$capability_local_description" ] &&
+        [ "$capability_local_identity" = "$capability_local_id" ] && capability_id_valid "$capability_local_agent" &&
+        capability_id_valid "$capability_local_permissions"
+}
+
+capability_find_installed() {
+    capability_find_id=$1
+    capability_found_count=0
+    capability_found_agent=''
+    capability_found_relative=''
+    for capability_candidate_agent in base-agent operator-agent wiki-agent; do
+        capability_candidate_relative=$capability_agent_prefix/$capability_candidate_agent/skills/$capability_find_id/SKILL.md
+        capability_candidate_directory=${capability_candidate_relative%/*}
+        if [ -e "$repository_root/$capability_candidate_directory" ] || [ -L "$repository_root/$capability_candidate_directory" ]; then
+            capability_found_count=$((capability_found_count + 1))
+            capability_found_agent=$capability_candidate_agent
+            capability_found_relative=$capability_candidate_relative
+        fi
+    done
+}
+
+capability_resolve() {
+    capability_requested_id=$1
+    capability_id=$(capability_alias_target "$capability_requested_id")
+    capability_id_valid "$capability_id" || return 1
+    capability_schema_version=1
+    capability_aliases=$(capability_aliases_for "$capability_id")
+    capability_kind=agent-skill
+    capability_availability=unavailable
+    capability_layer=none
+    capability_agent=''
+    capability_source=''
+    capability_entrypoint=''
+    capability_invocation=agent-mediated
+    capability_authority=''
+    capability_reason=not-installed
+    capability_shadowed_source=''
+
+    case "$capability_id" in
+        lint-wiki|release-workflow)
+            capability_kind=planned
+            capability_availability=planned
+            capability_layer=distribution
+            capability_invocation=agent-mediated
+            capability_reason=not-delivered
+            return 0
+            ;;
+    esac
+
+    capability_find_installed "$capability_id"
+    capability_installed_count=$capability_found_count
+    capability_installed_agent=$capability_found_agent
+    capability_installed_relative=$capability_found_relative
+    capability_local_relative=wiki/_capabilities/skills/$capability_id/SKILL.md
+    capability_local_file=$repository_root/$capability_local_relative
+    capability_local_present=0
+    if [ -e "$capability_local_file" ] || [ -L "$capability_local_file" ] || [ -e "${capability_local_file%/*}" ] || [ -L "${capability_local_file%/*}" ]; then
+        capability_local_present=1
+    fi
+
+    if [ "$capability_installed_count" -gt 1 ]; then
+        capability_availability=invalid
+        capability_reason=duplicate-installed-identity
+        return 0
+    fi
+
+    if [ "$capability_installed_count" -eq 1 ]; then
+        capability_agent=$capability_installed_agent
+        capability_source=$capability_installed_relative
+        capability_entrypoint=$capability_installed_relative
+        capability_layer=$capability_agent_layer
+        if ! capability_package_valid "$repository_root/$capability_installed_relative" "$capability_id" "$capability_installed_agent"; then
+            capability_availability=invalid
+            capability_reason=invalid-installed-package
+            return 0
+        fi
+        capability_authority=$capability_permission_value
+        if capability_agent_enabled "$capability_installed_agent"; then
+            capability_availability=available
+            capability_reason=$capability_agent_layer-enabled
+        else
+            capability_availability=disabled
+            capability_reason=agent-disabled
+        fi
+    fi
+
+    [ "$capability_local_present" -eq 1 ] || return 0
+    if ! capability_local_package_valid "$capability_local_file" "$capability_id"; then
+        capability_availability=invalid
+        capability_layer=repository
+        capability_source=$capability_local_relative
+        capability_entrypoint=$capability_local_relative
+        capability_reason=invalid-repository-package
+        return 0
+    fi
+
+    capability_local_status=$(capability_metadata_scalar "$capability_local_file" top status 2>/dev/null || printf '%s' active)
+    case "$capability_local_status" in active|draft|disabled|deprecated) ;; *)
+        capability_availability=invalid; capability_reason=invalid-repository-lifecycle; return 0 ;;
+    esac
+    capability_local_permission=$(capability_metadata_scalar "$capability_local_file" intelli_repo permissions 2>/dev/null || true)
+    [ -n "$capability_local_permission" ] || capability_local_permission=repository-defined
+
+    if [ "$capability_installed_count" -eq 0 ]; then
+        capability_agent=$(capability_metadata_scalar "$capability_local_file" intelli_repo agent 2>/dev/null || true)
+        capability_layer=repository
+        capability_source=$capability_local_relative
+        capability_entrypoint=$capability_local_relative
+        capability_authority=$capability_local_permission
+        if [ "$capability_local_status" = active ]; then
+            capability_availability=available
+            capability_reason=repository-owned
+        else
+            capability_availability=disabled
+            capability_reason=repository-lifecycle-$capability_local_status
+        fi
+        return 0
+    fi
+
+    capability_override_target=$(capability_metadata_scalar "$capability_local_file" intelli_repo target 2>/dev/null || true)
+    capability_override_compatible=$(capability_metadata_scalar "$capability_local_file" intelli_repo compatible 2>/dev/null || true)
+    capability_override_mode=$(capability_metadata_scalar "$capability_local_file" intelli_repo mode 2>/dev/null || true)
+    capability_override_rationale=$(capability_metadata_scalar "$capability_local_file" intelli_repo rationale 2>/dev/null || true)
+    capability_override_owner=$(capability_metadata_scalar "$capability_local_file" intelli_repo owner 2>/dev/null || true)
+    if [ "$capability_override_target" != "$capability_id" ] ||
+       { [ "$capability_override_compatible" != '*' ] && [ "$capability_override_compatible" != "$readonly_distribution_version" ]; } ||
+       [ -z "$capability_override_rationale" ] || [ -z "$capability_override_owner" ]; then
+        capability_availability=invalid
+        capability_layer=repository
+        capability_source=$capability_local_relative
+        capability_entrypoint=$capability_local_relative
+        capability_shadowed_source=$capability_installed_relative
+        capability_reason=invalid-repository-override
+        return 0
+    fi
+    case "$capability_override_mode" in
+        replace|extend)
+            capability_layer=repository
+            capability_source=$capability_local_relative
+            capability_entrypoint=$capability_local_relative
+            capability_shadowed_source=$capability_installed_relative
+            capability_authority=$capability_local_permission
+            if [ "$capability_local_status" = active ]; then
+                capability_availability=available
+                capability_reason=repository-$capability_override_mode
+            else
+                capability_availability=disabled
+                capability_reason=repository-lifecycle-$capability_local_status
+            fi
+            ;;
+        disable)
+            capability_layer=repository
+            capability_source=$capability_local_relative
+            capability_entrypoint=''
+            capability_shadowed_source=$capability_installed_relative
+            capability_authority=$capability_local_permission
+            capability_availability=disabled
+            capability_reason=repository-disable
+            ;;
+        *)
+            capability_availability=invalid
+            capability_layer=repository
+            capability_source=$capability_local_relative
+            capability_entrypoint=$capability_local_relative
+            capability_shadowed_source=$capability_installed_relative
+            capability_reason=invalid-repository-override-mode
+            ;;
+    esac
+}
+
+capability_json_string() {
+    printf '%s' "$1" | awk 'BEGIN { ORS = "" } {
+        if (NR > 1) printf "\\n"
+        gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); gsub(/\r/, "\\r")
+        printf "%s", $0
+    }'
+}
+
+capability_emit_record() {
+    if [ "$capability_output_format" = text ]; then
+        printf 'schema_version=%s id=%s aliases=%s kind=%s availability=%s layer=%s agent=%s source=%s entrypoint=%s invocation=%s authority=%s reason=%s shadowed_source=%s\n' \
+            "$capability_schema_version" "$capability_id" "$capability_aliases" "$capability_kind" "$capability_availability" \
+            "$capability_layer" "$capability_agent" "$capability_source" "$capability_entrypoint" "$capability_invocation" \
+            "$capability_authority" "$capability_reason" "$capability_shadowed_source"
+        return
+    fi
+    [ "$capability_json_first" -eq 1 ] || printf ','
+    capability_json_first=0
+    printf '{"schema_version":%s,"id":"' "$capability_schema_version"; capability_json_string "$capability_id"
+    printf '","aliases":['
+    if [ -n "$capability_aliases" ]; then printf '"'; capability_json_string "$capability_aliases"; printf '"'; fi
+    printf '],"kind":"'; capability_json_string "$capability_kind"
+    printf '","availability":"'; capability_json_string "$capability_availability"
+    printf '","layer":"'; capability_json_string "$capability_layer"
+    printf '","agent":"'; capability_json_string "$capability_agent"
+    printf '","source":"'; capability_json_string "$capability_source"
+    printf '","entrypoint":"'; capability_json_string "$capability_entrypoint"
+    printf '","invocation":"'; capability_json_string "$capability_invocation"
+    printf '","authority":"'; capability_json_string "$capability_authority"
+    printf '","reason":"'; capability_json_string "$capability_reason"
+    printf '","shadowed_source":"'; capability_json_string "$capability_shadowed_source"
+    printf '"}'
+}
+
+capability_prepare_repository() {
+    capability_requested_repository=$1
+    preflight_runtime
+    capability_agent_prefix=.intelli-repo
+    capability_agent_layer=installed
+    if [ "${INTELLI_REPO_INTERNAL_SOURCE_CATALOG:-}" = 1 ]; then
+        capability_source_request=$(canonical_requested_path "$capability_requested_repository") || fail 'target path cannot be resolved' "$readonly_exit_preflight"
+        repository_root=$(find_repository_root "$capability_source_request") || fail 'target is not a Git worktree' "$readonly_exit_preflight"
+        repository_root=$(CDPATH= cd -- "$repository_root" && pwd -P)
+        [ "$0" = "$repository_root/src/distribution/intelli-repo" ] || fail 'source catalog mode is restricted to the tracked development facade' "$readonly_exit_compatibility"
+        for capability_source_boundary in src src/agents src/agents/base-agent src/agents/operator-agent src/agents/wiki-agent; do
+            [ ! -L "$repository_root/$capability_source_boundary" ] || fail "symlinked source boundary is prohibited: $capability_source_boundary" "$readonly_exit_preflight"
+        done
+        capability_agent_prefix=src/agents
+        capability_agent_layer=source
+    else
+        resolve_installed_repository "$capability_requested_repository"
+    fi
+    for capability_agent_boundary in base-agent operator-agent wiki-agent; do
+        capability_skills_boundary=$repository_root/$capability_agent_prefix/$capability_agent_boundary/skills
+        [ -d "$capability_skills_boundary" ] && [ ! -L "$capability_skills_boundary" ] ||
+            fail "capability package boundary is unsafe: $capability_agent_prefix/$capability_agent_boundary/skills" "$readonly_exit_validation"
+    done
+    if [ "$capability_agent_layer" = installed ]; then
+        for capability_repository_boundary in wiki wiki/_capabilities wiki/_capabilities/skills; do
+            [ -d "$repository_root/$capability_repository_boundary" ] && [ ! -L "$repository_root/$capability_repository_boundary" ] ||
+                fail "repository capability boundary is unsafe: $capability_repository_boundary" "$readonly_exit_validation"
+        done
+    fi
+    if [ -e "$repository_root/repo-agent-config.yaml" ] && ! validate_configuration "$repository_root/repo-agent-config.yaml"; then
+        fail 'capability configuration is invalid' "$readonly_exit_validation"
+    fi
+}
+
+capability_catalog_ids() {
+    for capability_catalog_agent in base-agent operator-agent wiki-agent; do
+        capability_catalog_skills=$repository_root/$capability_agent_prefix/$capability_catalog_agent/skills
+        [ -d "$capability_catalog_skills" ] && [ ! -L "$capability_catalog_skills" ] || continue
+        find "$capability_catalog_skills" -mindepth 1 -maxdepth 1 ! -name .gitkeep -exec sh -c 'for path do printf "%s\n" "${path##*/}"; done' sh {} +
+    done
+    capability_repository_skills=$repository_root/wiki/_capabilities/skills
+    if [ -d "$capability_repository_skills" ] && [ ! -L "$capability_repository_skills" ]; then
+        find "$capability_repository_skills" -mindepth 1 -maxdepth 1 ! -name .gitkeep -exec sh -c 'for path do printf "%s\n" "${path##*/}"; done' sh {} +
+    fi
+    printf '%s\n' audit-wiki ingest-and-archive manage-plan-task-lifecycle lint-wiki release-workflow
+}
+
+capability_validate_catalog() {
+    repository_root=$1
+    capability_agent_prefix=.intelli-repo
+    capability_agent_layer=installed
+    if [ -e "$repository_root/repo-agent-config.yaml" ] && ! validate_configuration "$repository_root/repo-agent-config.yaml"; then
+        return 1
+    fi
+    capability_validation_ids=$(capability_catalog_ids | LC_ALL=C sort -u)
+    for capability_validation_id in $capability_validation_ids; do
+        capability_id_valid "$capability_validation_id" || return 1
+        capability_resolve "$capability_validation_id" || return 1
+        [ "$capability_availability" != invalid ] || return 1
+    done
+}
+
+capabilities_command() {
+    capability_requested_repository=.
+    capability_output_format=text
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --repo) [ "$#" -ge 2 ] || fail '--repo requires a value'; capability_requested_repository=$2; shift 2 ;;
+            --format) [ "$#" -ge 2 ] || fail '--format requires a value'; capability_output_format=$2; shift 2 ;;
+            --help|-h) printf '%s\n' 'Usage: intelli-repo capabilities [--repo PATH] [--format text|json]'; return ;;
+            *) fail "unknown capabilities argument: $1" ;;
+        esac
+    done
+    case "$capability_output_format" in text|json) ;; *) fail "unsupported capability output format: $capability_output_format" ;; esac
+    capability_prepare_repository "$capability_requested_repository"
+    capability_catalog_ids | while IFS= read -r capability_catalog_id; do
+        capability_id_valid "$capability_catalog_id" || fail "invalid capability directory identity: $capability_catalog_id" "$readonly_exit_validation"
+    done
+    capability_json_first=1
+    [ "$capability_output_format" = text ] || printf '['
+    capability_catalog_ids | LC_ALL=C sort -u | while IFS= read -r capability_catalog_id; do
+        capability_resolve "$capability_catalog_id" || continue
+        capability_emit_record
+    done
+    [ "$capability_output_format" = text ] || printf ']\n'
+}
+
+capability_show_command() {
+    [ "$#" -ge 1 ] || fail 'capability show requires CAPABILITY_ID'
+    capability_show_id=$1
+    shift
+    capability_requested_repository=.
+    capability_output_format=text
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --repo) [ "$#" -ge 2 ] || fail '--repo requires a value'; capability_requested_repository=$2; shift 2 ;;
+            --format) [ "$#" -ge 2 ] || fail '--format requires a value'; capability_output_format=$2; shift 2 ;;
+            *) fail "unknown capability show argument: $1" ;;
+        esac
+    done
+    case "$capability_output_format" in text|json) ;; *) fail "unsupported capability output format: $capability_output_format" ;; esac
+    capability_prepare_repository "$capability_requested_repository"
+    capability_resolve "$capability_show_id" || fail "unknown capability: $capability_show_id" "$readonly_exit_compatibility"
+    if [ "$capability_availability" = unavailable ] && [ "$capability_installed_count" -eq 0 ] && [ "$capability_local_present" -eq 0 ]; then
+        fail "unknown capability: $capability_show_id" "$readonly_exit_compatibility"
+    fi
+    capability_json_first=1
+    capability_emit_record
+    [ "$capability_output_format" = text ] || printf '\n'
+}
+
+capability_instructions_command() {
+    [ "$#" -ge 1 ] || fail 'capability instructions requires CAPABILITY_ID'
+    capability_instruction_id=$1
+    shift
+    capability_requested_repository=.
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --repo) [ "$#" -ge 2 ] || fail '--repo requires a value'; capability_requested_repository=$2; shift 2 ;;
+            *) fail "unknown capability instructions argument: $1" ;;
+        esac
+    done
+    capability_prepare_repository "$capability_requested_repository"
+    capability_resolve "$capability_instruction_id" || fail "unknown capability: $capability_instruction_id" "$readonly_exit_compatibility"
+    [ "$capability_kind" = agent-skill ] && [ "$capability_availability" = available ] && [ -n "$capability_entrypoint" ] ||
+        fail "capability instructions unavailable: $capability_instruction_id ($capability_availability)" "$readonly_exit_compatibility"
+    capability_instruction_file=$repository_root/$capability_entrypoint
+    [ -f "$capability_instruction_file" ] && [ ! -L "$capability_instruction_file" ] && [ -r "$capability_instruction_file" ] ||
+        fail "capability entrypoint is unsafe: $capability_instruction_id" "$readonly_exit_validation"
+    cat "$capability_instruction_file"
+}
+
+capability_command() {
+    capability_subcommand=${1:-}
+    [ "$#" -eq 0 ] || shift
+    case "$capability_subcommand" in
+        show) capability_show_command "$@" ;;
+        instructions) capability_instructions_command "$@" ;;
+        help|-h|--help|'') printf '%s\n' 'Usage: intelli-repo capability show CAPABILITY_ID [--repo PATH] [--format text|json]' '       intelli-repo capability instructions CAPABILITY_ID [--repo PATH]' ;;
+        *) fail "unknown capability subcommand: $capability_subcommand" ;;
+    esac
+}
+
+legacy_capability() {
+    legacy_name=$1
+    shift
+    [ "$#" -eq 0 ] || fail "legacy capability position does not accept arguments: $legacy_name"
+    capability_requested_repository=${INTELLI_REPO_REPOSITORY:-.}
+    capability_prepare_repository "$capability_requested_repository"
+    capability_resolve "$legacy_name" || fail "unknown capability: $legacy_name" "$readonly_exit_compatibility"
+    fail "capability $legacy_name resolves to $capability_id as $capability_kind/$capability_availability with $capability_invocation invocation; use capability show or capability instructions" "$readonly_exit_compatibility"
 }
 
 command_name=${1:-help}
@@ -2427,10 +2888,12 @@ case "$command_name" in
     configure) configure_command "$@" ;;
     update) update_command "$@" ;;
     doctor) doctor_command "$@" ;;
+    capabilities) capabilities_command "$@" ;;
+    capability) capability_command "$@" ;;
     uninstall) uninstall_command "$@" ;;
     _apply-update) apply_update_command "$@" ;;
     _credential-consume) credential_consume_command "$@" ;;
     _dotenv-read) dotenv_read_command "$@" ;;
-    lint|audit|ingest|task|release) unavailable_capability "$command_name" ;;
+    lint|audit|ingest|task|release) legacy_capability "$command_name" "$@" ;;
     *) usage >&2; fail "unknown command: $command_name" ;;
 esac

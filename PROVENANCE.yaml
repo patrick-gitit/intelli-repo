@@ -1,8 +1,8 @@
 schema_version: 1
-distribution_version: "v0.1.0-beta.2.5"
-source_revision: "73cfd236c3f7d878a95954e54a3e4e987deaccb7"
-installer_revision: "73cfd236c3f7d878a95954e54a3e4e987deaccb7"
-installer_sha256: "a293d9a3fd352e1202577c86d676094fab9e389f406d01d0fe8376189751d445"
+distribution_version: "v0.1.0-beta.2.6"
+source_revision: "300e2fd3ec58242e9ee643d1d7dd1b774596015e"
+installer_revision: "300e2fd3ec58242e9ee643d1d7dd1b774596015e"
+installer_sha256: "7e169b123d278dac28a2d0045b722259454271a98ddb0322553aee44001bf215"
 components:
   base_agent: "a6d697c28238f2c2b3f5bbf3ce24f39e39c4ccaf"
   operator_agent: "49175ac1f1a7bf1e57c74d2d34c9567c916102d5"

@@ -4,7 +4,7 @@
 
 Intelli-Repo turns an ordinary Git repository into a structured, inspectable environment for doing valuable work—and improving how that work gets done. Knowledge stays close to the work it informs. Decisions and policies make direction explicit, while tasks turn intent into action. Evidence preserves what happened and why. Humans and agents collaborate in the same version-controlled space, keeping the journey from idea to outcome understandable, reusable, and continuously improvable.
 
-> **Beta status:** `v0.1.0-beta.2.5` is the current public beta. Its pre-1.0 compatibility contract may change in later releases.
+> **Beta status:** `v0.1.0-beta.2.6` is the current public beta. Its pre-1.0 compatibility contract may change in later releases.
 
 ## Install
 
@@ -19,7 +19,7 @@ The script on `main` points to one approved, immutable release. It does not sear
 To install the current beta from its immutable tag, use:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/patrick-gitit/intelli-repo/v0.1.0-beta.2.5/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/patrick-gitit/intelli-repo/v0.1.0-beta.2.6/install.sh | sh
 ```
 
 You can also use `--version VERSION` when you need an explicit immutable version. Before running versioned content, the bootstrap verifies the selected tag's provenance and checksums.
@@ -83,6 +83,9 @@ intelli-repo configure [--repo PATH] [--set-agent NAME=enabled|disabled]... [--d
 intelli-repo update [--repo PATH] --version VERSION [--dry-run] [--yes]
 intelli-repo update [--repo PATH] --rollback OPERATION_ID [--dry-run] [--yes]
 intelli-repo doctor [--repo PATH]
+intelli-repo capabilities [--repo PATH] [--format text|json]
+intelli-repo capability show CAPABILITY_ID [--repo PATH] [--format text|json]
+intelli-repo capability instructions CAPABILITY_ID [--repo PATH]
 intelli-repo uninstall [--repo PATH] [--dry-run] [--yes]
 intelli-repo uninstall [--repo PATH] --purge-user-data --confirm-purge DELETE-USER-DATA [--yes]
 intelli-repo lint|audit|ingest|task|release
@@ -197,7 +200,9 @@ The following lifecycle operations are implemented:
 - Explicit purge
 - Clean reinstall
 
-Agent-provided `lint`, `audit`, `ingest`, `task`, and `release` commands remain unavailable until their respective agents implement them. These commands fail closed instead of pretending to complete work.
+The installed facade exposes a harness-neutral capability catalog. `audit` resolves to the available `audit-wiki` Agent Skills package. `ingest` and `task` resolve to their installed agent skills. These are agent-mediated capabilities, not shell commands. Use `capability instructions` to retrieve the exact effective `SKILL.md` bytes for an available skill.
+
+`lint` and `release` are planned capabilities. Their legacy command positions, along with the agent-mediated legacy positions, fail closed and report catalog-derived kind, availability, and invocation truth. Optional harness adapters may consume the neutral JSON catalog, but the core installation does not detect, configure, or depend on a named harness.
 
 A release is not ready until its lifecycle and rollback gates pass. Release candidates are checked for public-tree integrity and reproducibility. They are also tested for bootstrap behavior, lifecycle behavior, adversarial input handling, secret redaction, and refusal to publish without approval.
 
