@@ -4,6 +4,15 @@ All notable user-visible changes to Intelli-Repo are documented here. Versions f
 
 ## Unreleased
 
+## v0.1.0-beta.2.6: 2026-10-07
+
+### Highlights
+
+- Added a deterministic, harness-neutral capability catalog with text and JSON output.
+- Added capability inspection and exact instruction retrieval for installed agent-mediated skills.
+- Added truthful disabled, unavailable, alias, and invalid-package dispositions without named-harness dependencies.
+- Published the capability-discovery implementation in the public beta distribution.
+
 ## v0.1.0-beta.2.1 — 2026-08-26
 
 ### Highlights
