@@ -4,7 +4,37 @@
 
 Intelli-Repo turns an ordinary Git repository into a structured, inspectable environment for doing valuable work—and improving how that work gets done. Knowledge stays close to the work it informs. Decisions and policies make direction explicit, while tasks turn intent into action. Evidence preserves what happened and why. Humans and agents collaborate in the same version-controlled space, keeping the journey from idea to outcome understandable, reusable, and continuously improvable.
 
-> **Beta status:** `v0.1.0-beta.2.7` is the current public beta. Its pre-1.0 compatibility contract may change in later releases.
+> **Beta status:** `v0.1.0-beta.2.8` is the current public beta. Its pre-1.0 compatibility contract may change in later releases.
+
+## Current release: v0.1.0-beta.2.8
+
+Keep release documentation aligned with the shipped capability catalog
+
+Date: 2026-10-07. Channel: beta. Profile: documentation.
+
+### Highlights
+
+- Generate the public release summary, changelog section, and versioned note from one version-specific manifest.
+- Document every shipped agent skill, alias, invocation mode, and availability state using the executable capability catalog.
+- Verify exact documentation bytes before publication and during immutable release retries.
+
+### Migration
+
+No runtime migration is required. Use the current stable or immutable bootstrap for an existing compatible installation.
+
+### Rollback
+
+Use intelli-repo update --rollback OPERATION_ID while its receipt remains valid and owned state is unchanged.
+
+### Known limitations
+
+The beta compatibility contract may change. Dotenv support is Linux-only and stores user-managed plaintext. Native macOS and Windows dotenv validation remains deferred. Installed lint and release capabilities remain planned. Agent skills require agent-mediated invocation.
+
+### Verification
+
+Release gates verify deterministic bytes, checksums, fresh installation, capability catalog agreement, user-file preservation, source exclusion, immutable Git identity, and Presentation read-back.
+
+[Versioned release note](release-notes/v0.1.0-beta.2.8.md).
 
 ## Install
 
@@ -19,7 +49,7 @@ The script on `main` points to one approved, immutable release. It does not sear
 To install the current beta from its immutable tag, use:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/patrick-gitit/intelli-repo/v0.1.0-beta.2.7/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/patrick-gitit/intelli-repo/v0.1.0-beta.2.8/install.sh | sh
 ```
 
 You can also use `--version VERSION` when you need an explicit immutable version. Before running versioned content, the bootstrap verifies the selected tag's provenance and checksums.
@@ -89,6 +119,8 @@ intelli-repo capability instructions CAPABILITY_ID [--repo PATH]
 intelli-repo uninstall [--repo PATH] [--dry-run] [--yes]
 intelli-repo uninstall [--repo PATH] --purge-user-data --confirm-purge DELETE-USER-DATA [--yes]
 intelli-repo lint|audit|ingest|task|release
+intelli-repo version
+intelli-repo help
 ```
 
 ## How lifecycle operations behave
@@ -209,6 +241,34 @@ A release is not ready until its lifecycle and rollback gates pass. Release cand
 Private release evidence records the exact source revision. It also records the tooling revision, agent revisions, public distribution revision, and gate results. A missing required gate or a required skipped gate makes the evaluation fail.
 
 This evidence shows conformance to the declared script contract. It does not certify every possible host environment, and it never grants permission to publish a release.
+
+### Capability reference
+
+The following catalog is generated from the exact release inputs. Available agent skills are interpreted by an authorized agent; they are not directly runnable shell commands.
+
+| Capability | Aliases | Kind | Availability | Invocation | Agent | Authority | Description |
+|---|---|---|---|---|---|---|---|
+| `audit-wiki` | `audit` | agent-skill | available | agent-mediated | wiki-agent | read-only | Inspect wiki metadata, links, provenance, and lifecycle conformance without mutation. |
+| `capability-composition` | none | agent-skill | available | agent-mediated | base-agent | read-only | Resolve layered capabilities and the authority that constrains them. |
+| `classify-authority` | none | agent-skill | available | agent-mediated | wiki-agent | read-only-until-classification-recording-is-authorized | Classify source authority before recording an authorized disposition. |
+| `complete-work` | none | agent-skill | available | agent-mediated | base-agent | repository-local-note-editing-when-authorized | Verify task gates and record authorized completion evidence. |
+| `decompose-claims` | none | agent-skill | available | agent-mediated | wiki-agent | wiki-note-editing-when-authorized | Split an intake source into material claims for traceable accounting. |
+| `escalate-and-handoff` | none | agent-skill | available | agent-mediated | operator-agent | read-only-until-authority-is-granted | Identify an authority gap and prepare an authorized handoff. |
+| `evidence-receipts` | none | agent-skill | available | agent-mediated | base-agent | repository-local-log-editing-when-authorized | Record bounded evidence for an authorized operation. |
+| `execute-approved-plan` | none | agent-skill | available | agent-mediated | operator-agent | task-scoped-workspace-editing-when-authorized | Carry out explicitly authorized workspace work under the applicable contract. |
+| `governance-preflight` | none | agent-skill | available | agent-mediated | base-agent | read-only-until-scope-is-confirmed | Read task-relevant governance before acting. |
+| `ingest-and-archive` | `ingest` | agent-skill | available | agent-mediated | wiki-agent | archive-mutation-when-authorized | Account for source claims and archive only after the ingestion gates pass. |
+| `inventory-inbox` | none | agent-skill | available | agent-mediated | wiki-agent | read-only-until-inventory-recording-is-authorized | Inventory intake sources and material claims before ingestion. |
+| `lint-wiki` | `lint` | planned | planned | agent-mediated | distribution | none | Planned wiki lint capability; direct shell execution is unavailable. |
+| `maintain-wiki-scaffold` | none | agent-skill | available | agent-mediated | wiki-agent | wiki-path-editing-when-authorized | Maintain the declared wiki layout within authorized paths. |
+| `manage-plan-task-lifecycle` | `task` | agent-skill | available | agent-mediated | wiki-agent | plan-and-task-note-editing-when-authorized | Track plan and task lifecycle transitions with evidence and archival gates. |
+| `mutate-workspace` | none | agent-skill | available | agent-mediated | operator-agent | task-scoped-workspace-editing-when-authorized | Apply bounded, explicitly authorized workspace changes. |
+| `preserve-unrelated-state` | none | agent-skill | available | agent-mediated | operator-agent | read-only-until-mutation-scope-is-confirmed | Inspect and preserve user files and unrelated repository state. |
+| `record-operation` | none | agent-skill | available | agent-mediated | operator-agent | repository-local-log-editing-when-authorized | Record non-secret evidence for an authorized operation. |
+| `release-workflow` | `release` | planned | planned | agent-mediated | distribution | none | Planned installed release capability; maintainer publication uses the separate design workflow. |
+| `route-artifacts` | none | agent-skill | available | agent-mediated | wiki-agent | wiki-note-editing-when-authorized | Route knowledge artifacts to their authoritative registers. |
+| `run-workflow` | none | agent-skill | available | agent-mediated | operator-agent | local-command-execution-when-authorized | Run declared local workflows only within granted command authority. |
+| `scoped-planning` | none | agent-skill | available | agent-mediated | base-agent | repository-local-note-editing-when-authorized | Define a bounded scope and evidence gates for authorized work. |
 
 ## Troubleshooting
 
