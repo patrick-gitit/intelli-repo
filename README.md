@@ -4,19 +4,19 @@
 
 Intelli-Repo turns an ordinary Git repository into a structured, inspectable environment for doing valuable work—and improving how that work gets done. Knowledge stays close to the work it informs. Decisions and policies make direction explicit, while tasks turn intent into action. Evidence preserves what happened and why. Humans and agents collaborate in the same version-controlled space, keeping the journey from idea to outcome understandable, reusable, and continuously improvable.
 
-> **Beta status:** `v0.1.0-beta.2.8` is the current public beta. Its pre-1.0 compatibility contract may change in later releases.
+> **Beta status:** `v0.1.0-beta.2.9` is the current public beta. Its pre-1.0 compatibility contract may change in later releases.
 
-## Current release: v0.1.0-beta.2.8
+## Current release: v0.1.0-beta.2.9
 
-Keep release documentation aligned with the shipped capability catalog
+Validate ordinary release scope and publication capability
 
-Date: 2026-10-07. Channel: beta. Profile: documentation.
+Date: 2026-10-07. Channel: beta. Profile: fix.
 
 ### Highlights
 
-- Generate the public release summary, changelog section, and versioned note from one version-specific manifest.
-- Document every shipped agent skill, alias, invocation mode, and availability state using the executable capability catalog.
-- Verify exact documentation bytes before publication and during immutable release retries.
+- Derive release change scope from Git ancestry and exact shipped bytes.
+- Verify publication capability and exact read-back without a version-scoped override.
+- Preserve immutable tags, Parent pins, and no-op retry identity across publication.
 
 ### Migration
 
@@ -34,7 +34,7 @@ The beta compatibility contract may change. Dotenv support is Linux-only and sto
 
 Release gates verify deterministic bytes, checksums, fresh installation, capability catalog agreement, user-file preservation, source exclusion, immutable Git identity, and Presentation read-back.
 
-[Versioned release note](release-notes/v0.1.0-beta.2.8.md).
+[Versioned release note](release-notes/v0.1.0-beta.2.9.md).
 
 ## Install
 
@@ -49,7 +49,7 @@ The script on `main` points to one approved, immutable release. It does not sear
 To install the current beta from its immutable tag, use:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/patrick-gitit/intelli-repo/v0.1.0-beta.2.8/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/patrick-gitit/intelli-repo/v0.1.0-beta.2.9/install.sh | sh
 ```
 
 You can also use `--version VERSION` when you need an explicit immutable version. Before running versioned content, the bootstrap verifies the selected tag's provenance and checksums.

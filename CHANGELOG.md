@@ -4,6 +4,34 @@ All notable user-visible changes to Intelli-Repo are documented here. Versions f
 
 ## Unreleased
 
+## v0.1.0-beta.2.9: 2026-10-07
+
+Validate ordinary release scope and publication capability
+
+Date: 2026-10-07. Channel: beta. Profile: fix.
+
+### Highlights
+
+- Derive release change scope from Git ancestry and exact shipped bytes.
+- Verify publication capability and exact read-back without a version-scoped override.
+- Preserve immutable tags, Parent pins, and no-op retry identity across publication.
+
+### Migration
+
+No runtime migration is required. Use the current stable or immutable bootstrap for an existing compatible installation.
+
+### Rollback
+
+Use intelli-repo update --rollback OPERATION_ID while its receipt remains valid and owned state is unchanged.
+
+### Known limitations
+
+The beta compatibility contract may change. Dotenv support is Linux-only and stores user-managed plaintext. Native macOS and Windows dotenv validation remains deferred. Installed lint and release capabilities remain planned. Agent skills require agent-mediated invocation.
+
+### Verification
+
+Release gates verify deterministic bytes, checksums, fresh installation, capability catalog agreement, user-file preservation, source exclusion, immutable Git identity, and Presentation read-back.
+
 ## v0.1.0-beta.2.8: 2026-10-07
 
 Keep release documentation aligned with the shipped capability catalog
